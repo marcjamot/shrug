@@ -1,0 +1,5 @@
+# Build output
+apps/mac/.build/
+apps/mac/build/
+.DS_Store
+.vscode/

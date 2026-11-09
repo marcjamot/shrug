@@ -1,0 +1,27 @@
+#!/bin/bash
+# Sets up Shrug on this Mac, from a download (or checkout) of this repo:
+#
+#   ./setup        (or: bash setup)
+#
+# Builds and installs Shrug, starts it, then asks where your vault lives and for your
+# Shrug password. On the very first Mac it creates the vault instead.
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")" && pwd)
+
+if ! xcode-select -p >/dev/null 2>&1; then
+  echo "Shrug is built from source, which needs Apple's Command Line Tools."
+  xcode-select --install 2>/dev/null || true
+  echo "Install them from the window that opened, then run this again."
+  exit 1
+fi
+
+bash "$ROOT/apps/mac/scripts/install.sh"
+open "$HOME/Applications/Shrug.app"
+CTL="$HOME/Applications/Shrug.app/Contents/Helpers/shrug"
+for _ in $(seq 1 20); do "$CTL" status >/dev/null 2>&1 && break; sleep 1; done
+if "$CTL" status | grep -q "Not set up"; then
+  "$CTL" setup "$@"
+else
+  echo "Shrug is already set up on this Mac:"
+  "$CTL" status
+fi
