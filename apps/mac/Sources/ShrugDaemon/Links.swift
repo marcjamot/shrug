@@ -22,7 +22,8 @@ enum Outcome {
 ///   recorded  the links Shrug itself placed here (it only ever removes those)
 ///   actual    what's on disk
 /// It only deletes a real file you chose against: one in the way is pulled into Shrug, or
-/// left alone until you choose.
+/// left alone until you choose. Deleting one of its links yourself is a `shrug remove`.
+/// Deleting a linked file in ~/Shrug removes its link; renaming it there moves the link along.
 extension Engine {
     enum Found: Equatable { case nothing, ourLink, otherLink, file, folder }
 
@@ -71,17 +72,35 @@ extension Engine {
         var notes: [String] = []
         var notices: [String] = []
         var imported = false
+        var deleted: [Link] = []
         for link in st.links {
             let url = paths.expand(link.path)
             do {
                 switch found(url, link.target) {
                 case .ourLink:
                     if store.entry(link.target) == nil && !store.isDirectory(link.target) {
+                        if recorded[link.path] == link.target {
+                            deleted.append(link)
+                            recorded[link.path] = nil
+                            unlink(url.path)
+                            let note = "unlinked  \(link.path) (its file in ~/Shrug was deleted)"
+                            notes.append(note)
+                            notices.append(note)
+                            break
+                        }
                         try store.createFile(link.target)
                         imported = true
                     }
                     recorded[link.path] = link.target
                 case .nothing:
+                    if recorded[link.path] == link.target {
+                        deleted.append(link)
+                        recorded[link.path] = nil
+                        let note = "unlinked  \(link.path) (deleted on this Mac; the file stays in ~/Shrug/\(link.target))"
+                        notes.append(note)
+                        notices.append(note)
+                        break
+                    }
                     if store.entry(link.target) == nil {
                         guard !store.isDirectory(link.target) else { throw ShrugError("\(link.target) is a folder") }
                         try store.createFile(link.target)
@@ -116,12 +135,17 @@ extension Engine {
                         notices.append(note)
                     }
                 case .otherLink:
+                    let retargeted = recorded[link.path].map { found(url, $0) == .ourLink } ?? false
                     unlink(url.path)
                     try place(url, link.target)
                     recorded[link.path] = link.target
-                    let note = "replaced  the link that was at \(link.path)"
-                    notes.append(note)
-                    notices.append(note)
+                    if retargeted {
+                        notes.append("relinked  \(link.path) -> \(link.target)")
+                    } else {
+                        let note = "replaced  the link that was at \(link.path)"
+                        notes.append(note)
+                        notices.append(note)
+                    }
                 case .folder:
                     let note = "skipped   \(link.path): a folder is in the way"
                     notes.append(note)
@@ -133,6 +157,7 @@ extension Engine {
                 notices.append(note)
             }
         }
+        if !deleted.isEmpty { editProfile { links in links.removeAll { deleted.contains($0) } } }
         let wanted = Set(st.links.map(\.path))
         for (path, target) in recorded where !wanted.contains(path) {
             let url = paths.expand(path)
@@ -205,6 +230,7 @@ extension Engine {
         let link = Link(path: tilde, target: t)
         let open = collisions([link], store, st.recorded).filter { choices[$0] == nil }
         if !open.isEmpty { return .collisions(open) }
+        if found(url, t) == .nothing { updateState { $0.recorded[tilde] = nil } }
         editProfile { links in
             links.removeAll { $0.path == tilde }
             links.append(link)
@@ -221,6 +247,20 @@ extension Engine {
         editProfile { $0.removeAll { $0.path == tilde } }
         reconcile()
         return "Removed the link at \(tilde). The file stays in ~/Shrug/\(link.target)."
+    }
+
+    /// After a rename in ~/Shrug: links to what moved follow it.
+    func renamed(_ from: String, _ to: String) {
+        func moved(_ target: String) -> String? {
+            target == from ? to : target.hasPrefix(from + "/") ? to + target.dropFirst(from.count) : nil
+        }
+        guard stateCopy()?.links.contains(where: { moved($0.target) != nil }) == true else { return }
+        editProfile { links in
+            for i in links.indices {
+                if let t = moved(links[i].target) { links[i].target = t }
+            }
+        }
+        reconcileSoon()
     }
 
     /// Lists the profiles (no name), or makes this Mac follow one (created if new).

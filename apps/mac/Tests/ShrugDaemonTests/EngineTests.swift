@@ -315,6 +315,80 @@ final class EngineTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: bCfg.path + ".before-shrug"))
     }
 
+    func testDeletingALinkRemovesIt() throws {
+        let (a, b) = try twoMacs()
+        _ = try a.engine.use("work", choices: [:])
+        a.sync()
+        _ = try b.engine.use("work", choices: [:])
+        let cfg = a.paths.home.appendingPathComponent(".kube/config")
+        _ = try a.engine.add(path: cfg.path, target: nil, cls: nil, choices: [:])
+        try a.write("synced/kube/config", Data("context".utf8))
+        a.sync()
+        b.sync()
+        b.engine.reconcile()
+        let bCfg = b.paths.home.appendingPathComponent(".kube/config")
+        XCTAssertEqual(b.engine.found(bCfg, "synced/kube/config"), .ourLink)
+
+        // Deleting the link is a `shrug remove`: it isn't put back, and the file stays in Shrug.
+        unlink(cfg.path)
+        a.engine.reconcile()
+        a.engine.reconcile()
+        XCTAssertEqual(a.engine.found(cfg, "synced/kube/config"), .nothing)
+        XCTAssertFalse(a.engine.status().links.contains { $0.path == "~/.kube/config" })
+        XCTAssertEqual(try a.read("synced/kube/config"), Data("context".utf8))
+        a.sync()
+        b.sync()
+        b.engine.reconcile()
+        XCTAssertEqual(b.engine.found(bCfg, "synced/kube/config"), .nothing, "gone on B too")
+
+        // Adding it again works, even when the delete wasn't noticed yet.
+        _ = try a.engine.add(path: cfg.path, target: nil, cls: nil, choices: [:])
+        unlink(cfg.path)
+        _ = try a.engine.add(path: cfg.path, target: nil, cls: nil, choices: [:])
+        XCTAssertEqual(a.engine.found(cfg, "synced/kube/config"), .ourLink)
+        XCTAssertEqual(try a.read("synced/kube/config"), Data("context".utf8))
+    }
+
+    func testRenamingInShrugMovesTheLinkAndDeletingRemovesIt() throws {
+        let (a, b) = try twoMacs()
+        _ = try a.engine.use("work", choices: [:])
+        a.sync()
+        _ = try b.engine.use("work", choices: [:])
+        let cfg = a.paths.home.appendingPathComponent(".kube/config")
+        _ = try a.engine.add(path: cfg.path, target: nil, cls: nil, choices: [:])
+        try a.write("synced/kube/config", Data("context".utf8))
+        a.sync()
+        b.sync()
+        b.engine.reconcile()
+        let bCfg = b.paths.home.appendingPathComponent(".kube/config")
+
+        // Renaming the file, or its folder, in ~/Shrug: the link follows, on both Macs.
+        let kube = try a.lookup("synced/kube")
+        try a.fs.rename(kube, "config", kube, "work", a.ctx).get()
+        let synced = try a.lookup("synced")
+        try a.fs.rename(synced, "kube", synced, "k8s", a.ctx).get()
+        a.engine.reconcile()
+        XCTAssertEqual(a.engine.found(cfg, "synced/k8s/work"), .ourLink)
+        XCTAssertEqual(try a.read("synced/k8s/work"), Data("context".utf8))
+        a.sync()
+        b.sync()
+        b.engine.reconcile()
+        XCTAssertEqual(b.engine.found(bCfg, "synced/k8s/work"), .ourLink)
+        XCTAssertFalse(b.engine.status().notices.contains { $0.contains("replaced") }, "a move isn't a surprise")
+
+        // Deleting the file in ~/Shrug: it's gone, and so is the link. Nothing comes back empty.
+        try a.fs.remove(try a.lookup("synced/k8s"), "work", a.ctx).get()
+        a.engine.reconcile()
+        XCTAssertEqual(a.engine.found(cfg, "synced/k8s/work"), .nothing)
+        XCTAssertFalse(a.engine.status().links.contains { $0.path == "~/.kube/config" })
+        XCTAssertNil(a.engine.store?.entry("synced/k8s/work"))
+        a.sync()
+        b.sync()
+        b.engine.reconcile()
+        XCTAssertEqual(b.engine.found(bCfg, "synced/k8s/work"), .nothing)
+        XCTAssertNil(b.engine.store?.entry("synced/k8s/work"))
+    }
+
     func testUnlockAgainWithPassword() throws {
         let (a, _) = try twoMacs()
         try a.write("synced/x", Data("x".utf8))

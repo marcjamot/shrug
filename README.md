@@ -52,6 +52,10 @@ By default, `shrug add` uses the file's path relative to your home folder, minus
 
 If an app replaces a link with a real file when saving, Shrug moves the new file into `~/Shrug` and puts the link back. If a file already exists where a link should go, Shrug asks which version to keep and deletes the other.
 
+Deleting or moving a file at its usual path, like `rm ~/.kube/config`, removes only the link. The file stays at `~/Shrug/synced/kube/config`, and nothing in `~/.shrug` is deleted. Other Macs that follow the same profile lose the link too.
+
+Deleting or moving the file in `~/Shrug` changes the real file. Deleting `~/Shrug/synced/kube/config` deletes it on every Mac and removes the link at `~/.kube/config`. Renaming it, or moving it elsewhere in `synced/`, keeps the link working.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

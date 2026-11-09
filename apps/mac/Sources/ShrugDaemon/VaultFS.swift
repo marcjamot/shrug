@@ -332,6 +332,7 @@ final class VaultFS: NFSFileSystem {
             return .failure(.io)
         }
         moved(from, to)
+        engine.renamed(from, to)
         engine.localChange()
         return .success(())
     }
