@@ -31,6 +31,17 @@ struct LocalState: Codable {
     /// Set after the first complete pass. Until then this Mac doesn't know what the bucket
     /// holds, so it must not touch links: a file here could look new and overwrite the real one.
     var everSynced = false
+    /// Networks where this Mac stays unlocked when the screen locks (`shrug trust`). Never
+    /// uploaded: each Mac decides for itself. Nil in state saved before this existed.
+    var trusted: [TrustedNetwork]?
+}
+
+/// A network you trust on this Mac, known by its router.
+struct TrustedNetwork: Codable, Equatable {
+    var name: String
+    /// The router's hardware address (see NetworkWatch).
+    var router: String
+    var addedAt: Date
 }
 
 /// What a pass over the bucket needs, valid until the next lock.
@@ -52,12 +63,16 @@ public struct PasswordNeeded: Error, CustomStringConvertible {
 /// contact with the storage. Shrug locks when the screen locks, the Mac sleeps or you switch
 /// to another user. While locked, anything that needs a file asks Touch ID (or the Mac
 /// password) to unlock.
+///
+/// The one exception: on a network you trust (`shrug trust`), a screen lock doesn't lock
+/// Shrug. It stays unlocked until the Mac leaves that network, sleeps, or you switch users.
 public final class Engine {
     public let paths: ShrugPaths
     let clock: Clock
     let touchID: TouchIDKeyStore
     let chip: ChipSeal
     let screen: ScreenWatch
+    let network: NetworkWatch
 
     /// Guards the state below. Never held while waiting for Touch ID or the network.
     let lock = NSRecursiveLock()
@@ -80,6 +95,8 @@ public final class Engine {
     private var reconcileDue = false
     /// What the screen showed at the last look while unlocked (see `checkScreen`).
     private var lastScreen: ScreenState?
+    /// The trusted network keeping Shrug unlocked while the screen is locked (see `screenLocked`).
+    private var heldBy: String?
     var mounted = false
 
     var fs: VaultFS!
@@ -110,12 +127,13 @@ public final class Engine {
     let accessPromptTimeout: TimeInterval = 25
 
     public init(paths: ShrugPaths, clock: Clock = .system, touchID: TouchIDKeyStore? = nil, chip: ChipSeal? = nil,
-                screen: ScreenWatch = .system) {
+                screen: ScreenWatch = .system, network: NetworkWatch = .system) {
         self.paths = paths
         self.clock = clock
         self.touchID = touchID ?? TouchIDStore(url: paths.touchIDFile)
         self.chip = chip ?? SecureEnclaveSeal()
         self.screen = screen
+        self.network = network
         let env = ProcessInfo.processInfo.environment
         syncInterval = max(1, Int(env["SHRUG_SYNC_SECONDS"].flatMap(Double.init) ?? 60))
         debounce = env["SHRUG_DEBOUNCE_SECONDS"].flatMap(Double.init) ?? 3
@@ -154,7 +172,7 @@ public final class Engine {
         let distributed = DistributedNotificationCenter.default()
         observers.append((distributed, distributed.addObserver(forName: .init("com.apple.screenIsLocked"), object: nil,
                                                                queue: nil) { [weak self] _ in
-            self?.lockNow("screen locked")
+            self?.screenLocked()
         }))
         let workspace = NSWorkspace.shared.notificationCenter
         observers.append((workspace, workspace.addObserver(forName: NSWorkspace.willSleepNotification, object: nil,
@@ -410,6 +428,7 @@ public final class Engine {
         passDue = nil
         previewers = [:]
         lastScreen = nil
+        heldBy = nil
         lock.unlock()
         store?.close()
         fs.reset()
@@ -557,16 +576,83 @@ public final class Engine {
         lastScreen = now
         lock.unlock()
         guard let before else { return }
-        if now.locked && !before.locked {
-            lockNow("screen locked")
-        } else if before.ours && !now.ours {
+        if before.ours && !now.ours {
             lockNow("switched to another user")
+        } else if now.locked && !before.locked {
+            // With someone else at the screen, a trusted network keeps nothing open.
+            if now.ours { screenLocked() } else { lockNow("screen locked") }
+        } else if before.locked && !now.locked {
+            screenOpened()
         }
+    }
+
+    // MARK: - Trusted networks
+
+    /// The trusted network this Mac is on, if any. Not knowing the network is not trusting it.
+    func trustedNetwork(among trusted: [TrustedNetwork]) -> TrustedNetwork? {
+        guard !trusted.isEmpty, let router = network.current() else { return nil }
+        return trusted.first { $0.router == router }
+    }
+
+    /// The screen locked: Shrug locks too, unless this Mac is on a network you trust. Then it
+    /// stays unlocked, and `checkNetwork` locks it the moment the Mac is anywhere else.
+    func screenLocked() {
+        lock.lock()
+        let gen = generation
+        let trusted = (_unlocked ? _state?.trusted : nil) ?? []
+        lock.unlock()
+        guard let here = trustedNetwork(among: trusted) else { return lockNow("screen locked") }
+        lock.lock()
+        // Locked, or locked and unlocked again, while asking: nothing to hold open.
+        guard _unlocked, generation == gen else { return lock.unlock() }
+        let already = heldBy != nil
+        heldBy = here.name
+        lock.unlock()
+        // The notification and `checkScreen` can both get here for one screen lock.
+        if !already { event("Screen locked: staying unlocked on \(here.name)", log: "screen locked: staying unlocked on a trusted network") }
+    }
+
+    /// You're back at the screen: the next screen lock decides again.
+    private func screenOpened() {
+        lock.lock()
+        let was = heldBy
+        heldBy = nil
+        lock.unlock()
+        if was != nil { changed() }
+    }
+
+    /// While a trusted network keeps Shrug unlocked behind a locked screen: lock as soon as the
+    /// Mac isn't on one (it moved, the network dropped, or you stopped trusting it).
+    func checkNetwork() {
+        lock.lock()
+        let gen = generation
+        let held = _unlocked && heldBy != nil
+        let trusted = _state?.trusted ?? []
+        lock.unlock()
+        guard held else { return }
+        if let here = trustedNetwork(among: trusted) {
+            lock.lock()
+            if _unlocked, generation == gen, heldBy != nil { heldBy = here.name }
+            lock.unlock()
+            return
+        }
+        lock.lock()
+        let still = _unlocked && generation == gen && heldBy != nil
+        lock.unlock()
+        if still { lockNow("left the trusted network while the screen was locked") }
+    }
+
+    /// The network holding Shrug unlocked behind a locked screen, for status.
+    var heldOpenBy: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _unlocked ? heldBy : nil
     }
 
     func tick() {
         ticks += 1
         checkScreen()
+        checkNetwork()
         lock.lock()
         let store = _unlocked ? _store : nil
         var runPass = false

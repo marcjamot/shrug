@@ -62,6 +62,12 @@ public struct StatusInfo: Codable, Sendable {
     public var links: [LinkInfo]
     public var notices: [String]
     public var lastEvent: String?
+    /// Names of the networks this Mac trusts (see `shrug trust`).
+    public var trusted: [String]?
+    /// The trusted network this Mac is on now.
+    public var trustedHere: String?
+    /// The trusted network keeping Shrug unlocked while the screen is locked.
+    public var held: String?
 
     public init(setUp: Bool, unlocked: Bool, touchID: Bool, mounted: Bool, mount: String, device: String? = nil,
                 macs: [String] = [], profile: String? = nil, storage: String? = nil, online: Bool? = nil,

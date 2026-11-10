@@ -111,6 +111,10 @@ extension Engine {
                 return outcome(try add(path: a["path"] ?? "", target: a["target"], cls: cls, choices: Engine.choices(a)))
             case "remove":
                 return ok(try remove(path: a["path"] ?? ""))
+            case "trust":
+                return ok(try trust(name: a["name"], password: a["password"]))
+            case "untrust":
+                return ok(try untrust(name: a["name"]))
             default:
                 return IPCResponse(ok: false, message: "Unknown command '\(r.cmd)'")
             }
@@ -165,6 +169,10 @@ extension Engine {
         info.waiting = store.waitingCount + (st.profileDirty ? 1 : 0)
         info.links = linkInfos()
         info.notices = st.notices
+        let trusted = st.trusted ?? []
+        info.trusted = trusted.map(\.name)
+        info.trustedHere = trustedNetwork(among: trusted)?.name
+        info.held = heldOpenBy
         lock.lock()
         info.lastEvent = lastEventText
         lock.unlock()

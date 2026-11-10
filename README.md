@@ -31,6 +31,8 @@ Shrug keeps your files safe if you lose your computer. It won't stop a skilled a
 - Files are encrypted on your computer (AES-256-GCM) before they're uploaded, names included. The storage provider only sees random names, rough sizes and when files change.
 - Your Shrug password unlocks the vault key, which is stored in the bucket. Each computer also keeps a copy sealed by its security chip, so your fingerprint can unlock it.
 
+On a trusted network, your files are only as safe as the Mac's lock screen. Shrug knows a network by its router's hardware address, which someone who has been on that network can copy.
+
 Shrug doesn't protect copies that apps make on their own, such as autosaves, previews and exports. When two computers edit the same file, the newest edit wins, so an older edit made offline is lost.
 
 ## Setup
@@ -46,7 +48,9 @@ Create a Google Cloud Storage bucket and a service account with the Storage Obje
 | `shrug remove ~/.kube/config` | Removes the link but keeps the file in Shrug |
 | `shrug use`, `shrug use work` | Lists profiles, or follows one (a new name creates it) |
 | `shrug lock`, `shrug unlock` | Locks or unlocks Shrug |
-| `shrug status` | Shows the lock state, profile, storage and links |
+| `shrug trust`, `shrug trust office` | Trusts the network this Mac is on, with an optional name (asks for your fingerprint or Shrug password) |
+| `shrug untrust`, `shrug untrust office` | Stops trusting this network, or the one you name |
+| `shrug status` | Shows the lock state, profile, storage, trusted networks and links |
 
 By default, `shrug add` uses the file's path relative to your home folder, minus the leading dot so it isn't hidden. Add `--remote` or `--local` to put the file in that folder instead of `synced/`.
 

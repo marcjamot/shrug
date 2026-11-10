@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import ServiceManagement
 import ShrugCore
+import SystemConfiguration
 
 /// What the screen shows, as far as Shrug's lock goes.
 public struct ScreenState: Equatable, Sendable {
@@ -30,6 +31,47 @@ public struct ScreenWatch: Sendable {
         guard let info = CGSessionCopyCurrentDictionary() as? [String: Any] else { return nil }
         return ScreenState(locked: info["CGSSessionScreenIsLocked"] as? Bool ?? false,
                            ours: info[kCGSessionOnConsoleKey] as? Bool ?? true)
+    }
+}
+
+/// Where the engine asks which network the Mac is on, so tests can answer instead of macOS.
+public struct NetworkWatch: Sendable {
+    /// The router's hardware address ("a4:5e:60:01:02:03"). Nil when there's no telling: no
+    /// network, or one whose router macOS has no hardware address for.
+    public let current: @Sendable () -> String?
+
+    public init(_ current: @escaping @Sendable () -> String?) { self.current = current }
+
+    public static let system = NetworkWatch { Router.address() }
+}
+
+/// The router of the network the Mac uses, as macOS already has it on record. Nothing is
+/// sent and no permission is asked for. (The ARP table would say the same, but macOS hides it
+/// from apps.)
+enum Router {
+    static func address() -> String? {
+        guard let global = value("State:/Network/Global/IPv4"), let service = global["PrimaryService"] as? String,
+              let router = global["Router"] as? String,
+              let ipv4 = value("State:/Network/Service/\(service)/IPv4")
+        else { return nil }
+        return address(router: router, service: ipv4)
+    }
+
+    /// The hardware address macOS found for `router` when it joined the network, lowercased.
+    /// Nil if it's for another address, or isn't one device's address.
+    static func address(router: String, service: [String: Any]) -> String? {
+        guard service["ARPResolvedIPAddress"] as? String == router,
+              let found = service["ARPResolvedHardwareAddress"] as? String
+        else { return nil }
+        let bytes = found.split(separator: ":", omittingEmptySubsequences: false).map { UInt8($0, radix: 16) }
+        guard bytes.count == 6, !bytes.contains(nil), bytes.contains(where: { $0 != 0 }),
+              bytes.contains(where: { $0 != 0xFF })
+        else { return nil }
+        return bytes.map { String(format: "%02x", $0!) }.joined(separator: ":")
+    }
+
+    private static func value(_ key: String) -> [String: Any]? {
+        SCDynamicStoreCopyValue(nil, key as CFString) as? [String: Any]
     }
 }
 

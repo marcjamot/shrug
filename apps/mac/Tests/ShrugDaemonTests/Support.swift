@@ -43,14 +43,15 @@ final class Mac {
                           home: home, socket: home.appendingPathComponent(".shrug/shrug.sock").path)
     }
 
-    /// Unless a test passes its own `screen`, macOS is never asked about the real one. Every
+    /// Unless a test passes its own `screen` or `network`, macOS is never asked about the real one. Every
     /// Mac has its own security chip, which tests stand in for.
     init(_ root: URL, _ name: String, clock: TestClock, touchID: TouchIDKeyStore? = nil, chip: ChipSeal = FakeChip(),
-         screen: ScreenWatch = ScreenWatch { nil }) {
+         screen: ScreenWatch = ScreenWatch { nil }, network: NetworkWatch = NetworkWatch { nil }) {
         paths = Mac.paths(root, name)
         self.chip = chip
         try? FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
-        engine = Engine(paths: paths, clock: clock.clock, touchID: touchID, chip: chip, screen: screen)
+        engine = Engine(paths: paths, clock: clock.clock, touchID: touchID, chip: chip, screen: screen,
+                        network: network)
     }
 
     var fs: VaultFS { engine.fs }
@@ -149,8 +150,8 @@ class ShrugTestCase: XCTestCase {
     var storage: StorageConfig { StorageConfig(kind: "folder", path: bucket.path) }
 
     func mac(_ name: String, touchID: TouchIDKeyStore? = nil, chip: ChipSeal = FakeChip(),
-             screen: ScreenWatch = ScreenWatch { nil }) -> Mac {
-        Mac(root, name, clock: time, touchID: touchID, chip: chip, screen: screen)
+             screen: ScreenWatch = ScreenWatch { nil }, network: NetworkWatch = NetworkWatch { nil }) -> Mac {
+        Mac(root, name, clock: time, touchID: touchID, chip: chip, screen: screen, network: network)
     }
 
     /// Follows `profile` on `mac`, agreeing to every link it asks about (as answering "y" does).

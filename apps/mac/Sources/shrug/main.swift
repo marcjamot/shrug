@@ -16,6 +16,9 @@ Usage: shrug <command>
                            picks another folder
   remove <path>            Stop that link. The file stays in ~/Shrug
   use [<profile>]          Follow a profile (a new name creates one). Without a name, list them
+  trust [<name>]           Trust the network this Mac is on: Shrug stays unlocked there when
+                           the screen locks, until the Mac leaves it, sleeps or you switch user
+  untrust [<name>]         Stop trusting a network (this one, unless you name another)
   status                   Lock state, profile, storage, links
 
 Answers can also be piped in, one per line, in the order they're asked.
@@ -186,7 +189,8 @@ func printStatus(_ s: StatusInfo) {
         return
     }
     let tilde = s.mount.hasPrefix(paths.home.path + "/") ? "~/" + s.mount.dropFirst(paths.home.path.count + 1) : s.mount
-    print("Shrug:     \(s.unlocked ? "unlocked" : "locked")\(s.touchID ? "  [Touch ID on]" : "")")
+    let held = s.held.map { " (screen locked: staying unlocked on \($0))" } ?? ""
+    print("Shrug:     \(s.unlocked ? "unlocked" : "locked")\(held)\(s.touchID ? "  [Touch ID on]" : "")")
     print("Folder:    \(tilde)\(s.mounted ? "" : "  (NOT mounted)")")
     guard s.unlocked else {
         print("Unlock to see more.")
@@ -209,6 +213,9 @@ func printStatus(_ s: StatusInfo) {
         state = "up to date" + (s.lastSync.map { " (checked \(ago($0)))" } ?? "")
     }
     print("Storage:   \(s.storage ?? "-"): \(state)")
+    if let trusted = s.trusted, !trusted.isEmpty {
+        print("Trusted:   \(trusted.map { $0 == s.trustedHere ? "\($0) (this network)" : $0 }.joined(separator: ", "))")
+    }
     if !s.links.isEmpty {
         print("Links:")
         for l in s.links { print("  \(l.state == "ok" ? "ok" : "!!")  \(l.path) -> \(l.target)\(l.state == "ok" ? "" : ": \(l.state)")") }
@@ -302,6 +309,21 @@ case "add":
 case "remove":
     guard let path = args.first else { die("remove needs a path") }
     run("remove", ["path": absolute(path)])
+
+case "trust":
+    // Always confirmed, even when unlocked: a fingerprint, or else the Shrug password.
+    var a: [String: String] = [:]
+    if let name = args.first { a["name"] = name }
+    var r = rawSend("trust", a)
+    if r.code == "password-needed" {
+        a["password"] = ask("Shrug password", secret: true)
+        r = rawSend("trust", a)
+    }
+    guard r.ok else { die(r.message) }
+    print(r.message)
+
+case "untrust":
+    run("untrust", args.first.map { ["name": $0] } ?? [:])
 
 case "use":
     if let name = args.first { runChoosing("use", ["name": name]) }

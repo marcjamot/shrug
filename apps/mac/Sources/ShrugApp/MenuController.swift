@@ -89,6 +89,7 @@ final class MenuController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if s.unlocked {
             menu.addItem(disabled(storageLine(s)))
             if let p = s.profile { menu.addItem(disabled("Profile: \(p)")) }
+            if let here = s.trustedHere { menu.addItem(disabled("Trusted network: \(here)")) }
             let broken = s.links.filter { $0.state != "ok" }
             if !broken.isEmpty {
                 menu.addItem(.separator())
@@ -101,6 +102,11 @@ final class MenuController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if s.setUp {
             if s.unlocked {
                 menu.addItem(action("Lock Now", #selector(lockNow)))
+                if let here = s.trustedHere {
+                    menu.addItem(action("Stop Trusting \(here)", #selector(untrustNetwork)))
+                } else {
+                    menu.addItem(action("Trust This Network…", #selector(trustNetwork)))
+                }
             } else {
                 menu.addItem(action("Unlock" + (s.touchID ? "" : "…"), #selector(unlockTouchID)))
                 if s.touchID { menu.addItem(action("Unlock with Password…", #selector(unlockPassword))) }
@@ -185,6 +191,48 @@ final class MenuController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func lockNow() {
         engine.lockNow("locked from the menu")
         refreshIcon()
+    }
+
+    /// Asks what to call the network, then for a fingerprint (or the Shrug password).
+    @objc func trustNetwork() {
+        guard let name = ask("Trust This Network",
+                             "On this network, Shrug stays unlocked when the screen locks. It locks when the Mac "
+                                 + "leaves the network, sleeps, or you switch to another user.\n\n"
+                                 + "Anyone who gets past the Mac's lock screen here can then read your files.",
+                             button: "Trust", value: "home")
+        else { return }
+        background {
+            do {
+                _ = try self.engine.trust(name: name, password: nil)
+            } catch is PasswordNeeded {
+                DispatchQueue.main.async {
+                    guard let password = self.ask("Trust This Network", "Enter your Shrug password to confirm.",
+                                                  button: "Trust", secret: true)
+                    else { return }
+                    self.background { _ = try self.engine.trust(name: name, password: password) }
+                }
+            }
+        }
+    }
+
+    @objc func untrustNetwork() {
+        background { _ = try self.engine.untrust(name: nil) }
+    }
+
+    /// A dialog with one field. Nil if cancelled.
+    func ask(_ title: String, _ text: String, button: String, secret: Bool = false, value: String = "") -> String? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        let frame = NSRect(x: 0, y: 0, width: 260, height: 24)
+        let field = secret ? NSSecureTextField(frame: frame) : NSTextField(frame: frame)
+        field.stringValue = value
+        alert.accessoryView = field
+        alert.addButton(withTitle: button)
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        return alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
     }
 
     @objc func openFolder() {
