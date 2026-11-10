@@ -27,8 +27,11 @@ enum Mounter {
             "locallocks",
             // Revalidate on every open, so a lock takes effect even for cached files.
             "noac", "nonegnamecache",
-            // Fail instead of hanging forever if Shrug stops; long enough for a Touch ID prompt.
-            "soft", "timeo=600", "retrans=2",
+            // Fail instead of hanging forever if Shrug stops, but wait out a Touch ID prompt.
+            // Without dumbtimer, macOS ignores timeo and estimates it from loopback round
+            // trips, giving up after about half a second. Either way, a soft mount never
+            // waits much more than 30 seconds (Engine.accessPromptTimeout stays under that).
+            "soft", "dumbtimer", "timeo=300", "retrans=2",
             "rsize=65536", "wsize=65536", "noquota", "nobrowse",
         ].joined(separator: ",")
         let r = try run("/sbin/mount_nfs", ["-o", options, "127.0.0.1:/", url.path])

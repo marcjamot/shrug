@@ -83,6 +83,9 @@ public final class Engine {
     /// Quiet time after a change before it uploads, so one save is one upload (SHRUG_DEBOUNCE_SECONDS).
     let debounce: TimeInterval
     let denyCooldown: TimeInterval = 3
+    /// A program waiting on ~/Shrug gives up after about 30 seconds (see Mounter.mount), so
+    /// the prompt it caused closes first instead of unlocking for nobody.
+    let accessPromptTimeout: TimeInterval = 25
 
     public init(paths: ShrugPaths) {
         self.paths = paths
@@ -259,8 +262,8 @@ public final class Engine {
         try opened(master, local)
     }
 
-    func unlockWithTouchID(reason: String) throws {
-        let keys = try touchID.unlock(reason: reason)
+    func unlockWithTouchID(reason: String, timeout: TimeInterval = 60) throws {
+        let keys = try touchID.unlock(reason: reason, timeout: timeout)
         guard keys.count == 64 else { throw ShrugError("Touch ID data is damaged") }
         try opened(SymmetricKey(data: keys.prefix(32)), SymmetricKey(data: keys.suffix(32)))
     }
@@ -312,25 +315,32 @@ public final class Engine {
     }
 
     /// For the virtual folder: unlock with Touch ID if possible, else refuse quietly.
-    func unlockForAccess(_ prompt: String) -> Bool {
+    /// The NFS request doesn't say which program sent it, so the prompt can't either:
+    /// "Shrug is trying to unlock because a program is <doing> <path>."
+    func unlockForAccess(_ doing: String, _ path: String) -> Bool {
         if isUnlocked { return true }
-        lock.lock()
-        let refusing = deniedUntil.map { $0 > Date() } ?? false
-        lock.unlock()
         guard !refusing, touchID.isEnrolled else { return false }
         promptLock.lock()
         defer { promptLock.unlock() }
         if isUnlocked { return true }
+        // Waited behind a prompt that was just cancelled: don't ask again right away.
+        if refusing { return false }
         do {
-            try unlockWithTouchID(reason: prompt)
+            try unlockWithTouchID(reason: "unlock because a program is \(doing) \(path)", timeout: accessPromptTimeout)
             return true
         } catch {
             lock.lock()
             deniedUntil = Date().addingTimeInterval(denyCooldown)
             lock.unlock()
-            event("Stayed locked: \(prompt)", log: "stayed locked")
+            event("Stayed locked: a program was \(doing) \(path)", log: "stayed locked")
             return false
         }
+    }
+
+    private var refusing: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return deniedUntil.map { $0 > Date() } ?? false
     }
 
     /// For commands: immediate when unlocked, otherwise one Touch ID prompt.

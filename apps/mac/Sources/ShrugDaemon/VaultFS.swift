@@ -17,6 +17,8 @@ final class VaultFS: NFSFileSystem {
     private let uid = getuid()
     private let gid = getgid()
     private let started = Date()
+    /// ~/Shrug as you'd type it, for Touch ID prompts.
+    private let shownMount: String
     let caseInsensitive = false
 
     static let neverIndex = ".metadata_never_index"
@@ -24,6 +26,7 @@ final class VaultFS: NFSFileSystem {
 
     init(engine: Engine) {
         self.engine = engine
+        shownMount = engine.paths.contract(engine.paths.mount)
         reset()
     }
 
@@ -129,10 +132,11 @@ final class VaultFS: NFSFileSystem {
         return self.id(for: Store.parent(p))
     }
 
-    /// The store, unlocking first (with a Touch ID prompt) if needed.
-    private func openStore(_ prompt: @autoclosure () -> String) -> Store? {
+    /// The store, unlocking first (with a Touch ID prompt) if needed. `doing` finishes
+    /// "a program is …", like "opening".
+    private func openStore(_ doing: String, _ path: String) -> Store? {
         if let s = engine.store { return s }
-        guard engine.unlockForAccess(prompt()) else { return nil }
+        guard engine.unlockForAccess(doing, shownMount + "/" + path) else { return nil }
         return engine.store
     }
 
@@ -145,7 +149,7 @@ final class VaultFS: NFSFileSystem {
         if dirPath == VaultFS.neverIndex { return .failure(.notdir) }
         let child = VaultFS.join(dirPath, name)
         if engine.store == nil && VaultFS.quiet(name) { return .failure(.noent) }
-        guard let store = openStore("unlock to open \(child)") else { return .failure(.acces) }
+        guard let store = openStore("opening", child) else { return .failure(.acces) }
         return store.exists(child) ? .success(id(for: child)) : .failure(.noent)
     }
 
@@ -167,7 +171,7 @@ final class VaultFS: NFSFileSystem {
     private func file(_ id: UInt64, _ action: String) -> Result<(Store, String, Entry), NFSStat> {
         guard let path = path(id) else { return .failure(.stale) }
         if VaultFS.fixed[path] != nil { return .failure(.isdir) }
-        guard let store = openStore("unlock to \(action) \(path)") else { return .failure(.acces) }
+        guard let store = openStore(action, path) else { return .failure(.acces) }
         guard let e = store.entry(path) else { return .failure(.stale) }
         guard e.kind == .file else { return .failure(.isdir) }
         return .success((store, path, e))
@@ -176,7 +180,7 @@ final class VaultFS: NFSFileSystem {
     func read(_ id: UInt64, offset: UInt64, count: UInt32, _ ctx: NFSContext) -> Result<(Data, Bool), NFSStat> {
         if path(id) == VaultFS.neverIndex { return .success((Data(), true)) }
         let target: (Store, String, Entry)
-        switch file(id, "read") {
+        switch file(id, "reading") {
         case .failure(let e): return .failure(e)
         case .success(let t): target = t
         }
@@ -213,7 +217,7 @@ final class VaultFS: NFSFileSystem {
 
     func write(_ id: UInt64, offset: UInt64, data: Data, _ ctx: NFSContext) -> Result<Void, NFSStat> {
         let target: (Store, String, Entry)
-        switch file(id, "change") {
+        switch file(id, "changing") {
         case .failure(let e): return .failure(e)
         case .success(let t): target = t
         }
@@ -240,7 +244,7 @@ final class VaultFS: NFSFileSystem {
     private func folder(_ dir: UInt64) -> Result<(Store, String), NFSStat> {
         guard let dirPath = path(dir) else { return .failure(.stale) }
         if dirPath.isEmpty || dirPath == VaultFS.neverIndex { return .failure(.acces) }
-        guard let store = openStore("unlock to save in \(dirPath)") else { return .failure(.acces) }
+        guard let store = openStore("saving in", dirPath) else { return .failure(.acces) }
         guard store.isDirectory(dirPath) else { return .failure(.notdir) }
         return .success((store, dirPath))
     }
@@ -340,7 +344,7 @@ final class VaultFS: NFSFileSystem {
     func setattr(_ id: UInt64, _ attrs: NFSSetAttrs, _ ctx: NFSContext) -> Result<Void, NFSStat> {
         guard let path = path(id) else { return .failure(.stale) }
         if VaultFS.fixed[path] != nil { return attrs.size == nil && attrs.mode == nil ? .success(()) : .failure(.acces) }
-        guard let store = openStore("unlock to change \(path)") else { return .failure(.acces) }
+        guard let store = openStore("changing", path) else { return .failure(.acces) }
         guard store.exists(path) else { return .failure(.stale) }
         if let size = attrs.size {
             guard store.entry(path)?.kind == .file else { return .failure(.isdir) }
