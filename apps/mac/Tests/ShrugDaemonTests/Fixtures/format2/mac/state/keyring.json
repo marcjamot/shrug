@@ -1,0 +1,14 @@
+{
+  "local" : {
+    "iterations" : 1000,
+    "kdf" : "pbkdf2-sha256",
+    "salt" : "bL9D/Ir01yxq2/yQmzP48g==",
+    "wrappedKey" : "ZwV46wNlJLt/E42qDkQPiceXgGNsJ/98013UIKmL9JHZoxEvACoN9sOEICPr7bEhc9p57bH5LZBtBDly"
+  },
+  "vault" : {
+    "iterations" : 1000,
+    "kdf" : "pbkdf2-sha256",
+    "salt" : "bL9D/Ir01yxq2/yQmzP48g==",
+    "wrappedKey" : "M4mouuF/nCiBW7DAkw200HcAiwWUeG8issWvG2OeXddTLBmtUzIO77oF8CD7/Z4CrBbg/1yPm7PcsHi/"
+  }
+}

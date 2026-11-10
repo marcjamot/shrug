@@ -20,6 +20,9 @@ final class VaultFS: NFSFileSystem {
     /// ~/Shrug as you'd type it, for Touch ID prompts.
     private let shownMount: String
     let caseInsensitive = false
+    /// Plenty for secrets, and it keeps one stray write from filling the disk.
+    static let maxFileSize: UInt64 = 1 << 30
+    var maxFileSize: UInt64 { VaultFS.maxFileSize }
 
     static let neverIndex = ".metadata_never_index"
     static let fixed: [String: UInt64] = ["": 1, "local": 2, "synced": 3, "remote": 4, neverIndex: 5]
@@ -228,8 +231,10 @@ final class VaultFS: NFSFileSystem {
         defer { l.unlock() }
         do {
             let f = try store.open(path, writable: true)
+            // Shrug locked after the file opened: writing now would leave an edit that never uploads.
+            guard store.willChange(path) else { return .failure(.acces) }
             try f.write(offset: Int64(offset), data: data)
-            store.changed(path, size: f.size)
+            store.didWrite(path, size: f.size)
             engine.localChange()
             return .success(())
         } catch {
@@ -355,8 +360,9 @@ final class VaultFS: NFSFileSystem {
             do {
                 let f = try store.open(path, writable: true)
                 if f.size != Int64(size) {
+                    guard store.willChange(path) else { return .failure(.acces) }
                     try f.truncate(to: Int64(size))
-                    store.changed(path, size: f.size)
+                    store.didWrite(path, size: f.size)
                     engine.localChange()
                 }
             } catch {
@@ -369,7 +375,7 @@ final class VaultFS: NFSFileSystem {
         }
         switch attrs.mtime {
         case .unchanged: break
-        case .serverTime: store.update(path) { $0.mtime = .nowMs }
+        case .serverTime: store.update(path) { $0.mtime = engine.clock.nowMs }
         case .client(let t):
             store.update(path) { $0.mtime = Date(timeIntervalSince1970: Double(t.sec) + Double(t.nsec) / 1e9).ms }
         }

@@ -4,13 +4,13 @@ import Foundation
 public struct StoredObject: Sendable {
     public let key: String
     public let size: Int64
-    /// Changes whenever the object is replaced.
-    public let etag: String
+    /// This exact version of the object (a generation). It changes whenever the object is replaced.
+    public let version: String
 
-    public init(key: String, size: Int64, etag: String) {
+    public init(key: String, size: Int64, version: String) {
         self.key = key
         self.size = size
-        self.etag = etag
+        self.version = version
     }
 }
 
@@ -20,6 +20,8 @@ public enum StorageError: Error, CustomStringConvertible {
     case offline(String)
     /// The storage refused these credentials.
     case denied(String)
+    /// The object isn't the version the request named: it was replaced meanwhile.
+    case conflict
     case failed(String)
 
     public var description: String {
@@ -27,21 +29,33 @@ public enum StorageError: Error, CustomStringConvertible {
         case .notFound: return "not found"
         case .offline(let m): return "offline (\(m))"
         case .denied(let m): return "access denied (\(m))"
+        case .conflict: return "changed meanwhile"
         case .failed(let m): return m
         }
     }
 }
 
 /// Dumb object storage. Everything Shrug hands it is already encrypted.
+///
+/// Every write names the version it replaces (nil: the object must not exist yet), so two Macs
+/// never overwrite each other's changes unseen. Shrug never deletes objects.
 public protocol ObjectStorage: AnyObject {
     func list(prefix: String) throws -> [StoredObject]
-    /// The whole object, or the bytes in `range` (inclusive).
-    func get(_ key: String, range: ClosedRange<Int64>?) throws -> Data
-    /// Downloads the object into `file`, returning its etag.
-    func download(_ key: String, to file: URL) throws -> String
-    func put(_ key: String, data: Data) throws -> String
-    func upload(_ key: String, from file: URL) throws -> String
-    func delete(_ key: String) throws
+    /// The whole object, or the bytes in `range` (inclusive). With `version`, only from that version.
+    func get(_ key: String, range: ClosedRange<Int64>?, version: String?) throws -> Data
+    /// Downloads the object into `file`, returning its version. With `version`, only that version:
+    /// a replaced object is never downloaded, so its size can't be a surprise.
+    func download(_ key: String, to file: URL, version: String?) throws -> String
+    /// Returns the new version.
+    func put(_ key: String, data: Data, replacing version: String?) throws -> String
+    /// Returns the new version.
+    func upload(_ key: String, from file: URL, replacing version: String?) throws -> String
+}
+
+extension ObjectStorage {
+    public func get(_ key: String, version: String? = nil) throws -> Data {
+        try get(key, range: nil, version: version)
+    }
 }
 
 /// Where this Mac's vault lives. Nothing secret in here; the credentials are separate.
@@ -83,9 +97,10 @@ public enum Storage {
         case "gcs":
             guard let bucket = config.bucket, !bucket.isEmpty else { throw ShrugError("No bucket name") }
             guard let c = credentials, !c.accessID.isEmpty, !c.secret.isEmpty else { throw ShrugError("No credentials") }
-            let endpoint = URL(string: config.endpoint ?? "https://storage.googleapis.com")!
-            return S3Storage(endpoint: endpoint, bucket: bucket, region: config.region ?? "auto",
-                             accessID: c.accessID, secret: c.secret)
+            guard let endpoint = URL(string: config.endpoint ?? "https://storage.googleapis.com"), endpoint.scheme == "https"
+            else { throw ShrugError("The storage address must start with https://") }
+            return GCSStorage(endpoint: endpoint, bucket: bucket, region: config.region ?? "auto",
+                              accessID: c.accessID, secret: c.secret)
         case "folder":
             guard let path = config.path, !path.isEmpty else { throw ShrugError("No folder given") }
             return FolderStorage(root: URL(fileURLWithPath: path))
@@ -95,8 +110,9 @@ public enum Storage {
     }
 }
 
-/// A plain folder used as a bucket: each object is a file. If the folder is missing,
-/// the storage counts as offline, which is how tests switch the network off.
+/// A plain folder used as a bucket: each object is a file. If the folder is missing, the
+/// storage counts as offline, which is how tests switch the network off. Writes take a lock
+/// file, so several processes sharing the folder still get conditional writes.
 public final class FolderStorage: ObjectStorage {
     public let root: URL
 
@@ -111,10 +127,20 @@ public final class FolderStorage: ObjectStorage {
         }
     }
 
-    private func etag(_ url: URL) throws -> String {
+    /// A new inode, size or modification time means a new version.
+    private func version(_ url: URL) -> String? {
         var st = stat()
-        guard stat(url.path, &st) == 0 else { throw StorageError.notFound }
+        guard stat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { return nil }
         return "\(st.st_ino)-\(st.st_size)-\(st.st_mtimespec.tv_sec).\(st.st_mtimespec.tv_nsec)"
+    }
+
+    private func locked<T>(_ body: () throws -> T) throws -> T {
+        let fd = open(root.appendingPathComponent(".lock").path, O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0 else { throw StorageError.failed("Cannot lock \(root.path)") }
+        defer { close(fd) }
+        flock(fd, LOCK_EX)
+        defer { flock(fd, LOCK_UN) }
+        return try body()
     }
 
     public func list(prefix: String) throws -> [StoredObject] {
@@ -122,57 +148,54 @@ public final class FolderStorage: ObjectStorage {
         guard let walker = FileManager.default.enumerator(atPath: root.path) else { return [] }
         var out: [StoredObject] = []
         while let rel = walker.nextObject() as? String {
-            guard rel.hasPrefix(prefix), !(rel as NSString).lastPathComponent.hasPrefix(".tmp-") else { continue }
+            guard rel.hasPrefix(prefix), !(rel as NSString).lastPathComponent.hasPrefix(".") else { continue }
             let url = file(rel)
-            var st = stat()
-            guard stat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { continue }
-            out.append(StoredObject(key: rel, size: Int64(st.st_size), etag: try etag(url)))
+            guard let v = version(url), let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else { continue }
+            out.append(StoredObject(key: rel, size: Int64(size), version: v))
         }
         return out.sorted { $0.key < $1.key }
     }
 
-    public func get(_ key: String, range: ClosedRange<Int64>?) throws -> Data {
+    public func get(_ key: String, range: ClosedRange<Int64>?, version expected: String?) throws -> Data {
         try checkOnline()
-        guard let h = try? FileHandle(forReadingFrom: file(key)) else { throw StorageError.notFound }
+        let url = file(key)
+        guard let current = version(url), let h = try? FileHandle(forReadingFrom: url) else { throw StorageError.notFound }
         defer { try? h.close() }
+        if let expected, expected != current { throw StorageError.conflict }
         guard let range else { return h.readDataToEndOfFile() }
         try h.seek(toOffset: UInt64(range.lowerBound))
         return h.readData(ofLength: Int(range.upperBound - range.lowerBound + 1))
     }
 
-    public func download(_ key: String, to dest: URL) throws -> String {
+    public func download(_ key: String, to dest: URL, version expected: String?) throws -> String {
         try checkOnline()
         let src = file(key)
-        guard FileManager.default.fileExists(atPath: src.path) else { throw StorageError.notFound }
-        let tag = try etag(src)
+        guard let v = version(src) else { throw StorageError.notFound }
+        if let expected, expected != v { throw StorageError.conflict }
         try? FileManager.default.removeItem(at: dest)
         try FileManager.default.copyItem(at: src, to: dest)
-        return tag
+        return v
     }
 
-    private func place(_ key: String, _ write: (URL) throws -> Void) throws -> String {
+    private func place(_ key: String, replacing expected: String?, _ write: (URL) throws -> Void) throws -> String {
         try checkOnline()
         let dest = file(key)
         try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
         let tmp = dest.deletingLastPathComponent().appendingPathComponent(".tmp-\(UUID().uuidString)")
+        defer { unlink(tmp.path) }
         try write(tmp)
-        guard rename(tmp.path, dest.path) == 0 else {
-            unlink(tmp.path)
-            throw StorageError.failed("Cannot write \(key)")
+        return try locked {
+            guard version(dest) == expected else { throw StorageError.conflict }
+            guard rename(tmp.path, dest.path) == 0, let v = version(dest) else { throw StorageError.failed("Cannot write \(key)") }
+            return v
         }
-        return try etag(dest)
     }
 
-    public func put(_ key: String, data: Data) throws -> String {
-        try place(key) { try data.write(to: $0) }
+    public func put(_ key: String, data: Data, replacing version: String?) throws -> String {
+        try place(key, replacing: version) { try data.write(to: $0) }
     }
 
-    public func upload(_ key: String, from src: URL) throws -> String {
-        try place(key) { try FileManager.default.copyItem(at: src, to: $0) }
-    }
-
-    public func delete(_ key: String) throws {
-        try checkOnline()
-        unlink(file(key).path)
+    public func upload(_ key: String, from src: URL, replacing version: String?) throws -> String {
+        try place(key, replacing: version) { try FileManager.default.copyItem(at: src, to: $0) }
     }
 }

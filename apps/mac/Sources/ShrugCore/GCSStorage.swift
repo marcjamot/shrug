@@ -1,30 +1,58 @@
 import CryptoKit
 import Foundation
 
-/// AWS Signature Version 4, which Google Cloud Storage accepts with HMAC keys.
-public struct SigV4: Sendable {
+/// Signature Version 4 with an HMAC key, under Google's names (GOOG4-HMAC-SHA256). Google only
+/// accepts x-goog-* headers, which preconditions need, with its own names.
+public struct V4Signer: Sendable {
+    /// What one provider calls the parts of the algorithm.
+    public struct Names: Sendable {
+        public let algorithm: String
+        public let keyPrefix: String
+        public let service: String
+        public let requestType: String
+        /// "x-goog" for x-goog-date and x-goog-content-sha256.
+        public let headerPrefix: String
+
+        public init(algorithm: String, keyPrefix: String, service: String, requestType: String, headerPrefix: String) {
+            self.algorithm = algorithm
+            self.keyPrefix = keyPrefix
+            self.service = service
+            self.requestType = requestType
+            self.headerPrefix = headerPrefix
+        }
+
+        public static let google = Names(algorithm: "GOOG4-HMAC-SHA256", keyPrefix: "GOOG4", service: "storage",
+                                         requestType: "goog4_request", headerPrefix: "x-goog")
+
+        public var dateHeader: String { headerPrefix + "-date" }
+        public var payloadHeader: String { headerPrefix + "-content-sha256" }
+    }
+
     public let accessID: String
     public let secret: String
     public let region: String
-    public let service = "s3"
+    public let names: Names
 
-    public init(accessID: String, secret: String, region: String) {
+    public init(accessID: String, secret: String, region: String, names: Names = .google) {
         self.accessID = accessID
         self.secret = secret
         self.region = region
+        self.names = names
     }
 
     public static let emptyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-    public static func amzDate(_ date: Date) -> String {
+    private static let dateFormat: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = TimeZone(identifier: "UTC")
         f.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        return f.string(from: date)
-    }
+        return f
+    }()
 
-    /// RFC 3986 encoding as AWS wants it: everything but A-Z a-z 0-9 - _ . ~ (and "/" in paths).
+    public static func timestamp(_ date: Date) -> String { dateFormat.string(from: date) }
+
+    /// RFC 3986 encoding as V4 wants it: everything but A-Z a-z 0-9 - _ . ~ (and "/" in paths).
     static let unreserved = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~".utf8)
 
     public static func encode(_ s: String, keepSlash: Bool) -> String {
@@ -40,58 +68,63 @@ public struct SigV4: Sendable {
     }
 
     public static func canonicalQuery(_ query: [(String, String)]) -> String {
-        var pairs: [(String, String)] = []
-        for (k, v) in query { pairs.append((encode(k, keepSlash: false), encode(v, keepSlash: false))) }
-        pairs.sort { (a: (String, String), b: (String, String)) -> Bool in a.0 == b.0 ? a.1 < b.1 : a.0 < b.0 }
-        return pairs.map { "\($0.0)=\($0.1)" }.joined(separator: "&")
+        let pairs: [(String, String)] = query.map { (encode($0.0, keepSlash: false), encode($0.1, keepSlash: false)) }
+        let sorted = pairs.sorted { (a: (String, String), b: (String, String)) -> Bool in a.0 == b.0 ? a.1 < b.1 : a.0 < b.0 }
+        return sorted.map { "\($0.0)=\($0.1)" }.joined(separator: "&")
     }
 
     private static func hmac(_ key: Data, _ text: String) -> Data {
         Data(HMAC<SHA256>.authenticationCode(for: Data(text.utf8), using: SymmetricKey(data: key)))
     }
 
-    /// The Authorization header value. `headers` must include host, x-amz-date and
-    /// x-amz-content-sha256, and are all signed.
+    /// The Authorization header value. `headers` must include host and the date and payload-hash
+    /// headers (see Names), and are all signed: Google requires every x-goog-* header to be.
     public func authorization(method: String, path: String, query: [(String, String)], headers: [String: String],
                               payloadHash: String, date: Date) -> String {
-        let amz = SigV4.amzDate(date)
-        let day = String(amz.prefix(8))
-        let names = headers.keys.map { $0.lowercased() }.sorted()
+        let stamp = V4Signer.timestamp(date)
+        let day = String(stamp.prefix(8))
         let lower = Dictionary(uniqueKeysWithValues: headers.map { ($0.key.lowercased(), $0.value) })
-        let canonicalHeaders = names.map { "\($0):\(lower[$0]!.trimmingCharacters(in: .whitespaces))\n" }.joined()
-        let signedHeaders = names.joined(separator: ";")
-        let canonical = [method, SigV4.encode(path, keepSlash: true), SigV4.canonicalQuery(query),
+        let headerNames = lower.keys.sorted()
+        let canonicalHeaders = headerNames.map { "\($0):\(lower[$0]!.trimmingCharacters(in: .whitespaces))\n" }.joined()
+        let signedHeaders = headerNames.joined(separator: ";")
+        let canonical = [method, V4Signer.encode(path, keepSlash: true), V4Signer.canonicalQuery(query),
                          canonicalHeaders, signedHeaders, payloadHash].joined(separator: "\n")
-        let scope = "\(day)/\(region)/\(service)/aws4_request"
-        let toSign = ["AWS4-HMAC-SHA256", amz, scope, Data(SHA256.hash(data: Data(canonical.utf8))).hex]
+        let scope = "\(day)/\(region)/\(names.service)/\(names.requestType)"
+        let toSign = [names.algorithm, stamp, scope, Data(SHA256.hash(data: Data(canonical.utf8))).hex]
             .joined(separator: "\n")
-        var k = SigV4.hmac(Data("AWS4\(secret)".utf8), day)
-        k = SigV4.hmac(k, region)
-        k = SigV4.hmac(k, service)
-        k = SigV4.hmac(k, "aws4_request")
-        let signature = SigV4.hmac(k, toSign).hex
-        return "AWS4-HMAC-SHA256 Credential=\(accessID)/\(scope), SignedHeaders=\(signedHeaders), Signature=\(signature)"
+        var k = V4Signer.hmac(Data("\(names.keyPrefix)\(secret)".utf8), day)
+        k = V4Signer.hmac(k, region)
+        k = V4Signer.hmac(k, names.service)
+        k = V4Signer.hmac(k, names.requestType)
+        let signature = V4Signer.hmac(k, toSign).hex
+        return "\(names.algorithm) Credential=\(accessID)/\(scope), SignedHeaders=\(signedHeaders), Signature=\(signature)"
     }
 }
 
-/// An S3-compatible bucket over HTTPS (Google Cloud Storage's XML API, path style).
-public final class S3Storage: ObjectStorage {
+/// A Google Cloud Storage bucket over its XML API (path style, signed with an HMAC key).
+/// Object versions are GCS generations, and every write is conditional on one.
+public final class GCSStorage: ObjectStorage {
     let endpoint: URL
     let bucket: String
-    let signer: SigV4
+    let signer: V4Signer
     let session: URLSession
 
-    public init(endpoint: URL, bucket: String, region: String, accessID: String, secret: String) {
-        self.endpoint = endpoint
-        self.bucket = bucket
-        signer = SigV4(accessID: accessID, secret: secret, region: region)
+    public static func sessionConfiguration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 30
         config.timeoutIntervalForResource = 6 * 3600
         config.waitsForConnectivity = false
         config.httpCookieStorage = nil
         config.urlCache = nil
-        session = URLSession(configuration: config)
+        return config
+    }
+
+    public init(endpoint: URL, bucket: String, region: String, accessID: String, secret: String,
+                configuration: URLSessionConfiguration = GCSStorage.sessionConfiguration()) {
+        self.endpoint = endpoint
+        self.bucket = bucket
+        signer = V4Signer(accessID: accessID, secret: secret, region: region)
+        session = URLSession(configuration: configuration)
     }
 
     enum Body {
@@ -104,6 +137,8 @@ public final class S3Storage: ObjectStorage {
         let body: Data
     }
 
+    static let precondition = "x-goog-if-generation-match"
+
     /// One signed request. `saveTo` streams the response body into a file instead.
     private func send(_ method: String, key: String?, query: [(String, String)] = [], extra: [String: String] = [:],
                       body: Body = .none, saveTo: URL? = nil) throws -> Response {
@@ -112,37 +147,40 @@ public final class S3Storage: ObjectStorage {
         components.scheme = endpoint.scheme
         components.host = endpoint.host
         components.port = endpoint.port
-        components.percentEncodedPath = SigV4.encode(path, keepSlash: true)
-        let q = SigV4.canonicalQuery(query)
+        components.percentEncodedPath = V4Signer.encode(path, keepSlash: true)
+        let q = V4Signer.canonicalQuery(query)
         if !q.isEmpty { components.percentEncodedQuery = q }
         guard let url = components.url, let host = endpoint.host else { throw StorageError.failed("Bad storage URL") }
 
         let payload: String
         switch body {
-        case .none: payload = SigV4.emptyHash
+        case .none: payload = V4Signer.emptyHash
         case .data(let d): payload = Data(SHA256.hash(data: d)).hex
         case .file: payload = "UNSIGNED-PAYLOAD"
         }
         let now = Date()
         var headers = ["host": endpoint.port.map { "\(host):\($0)" } ?? host,
-                       "x-amz-date": SigV4.amzDate(now), "x-amz-content-sha256": payload]
+                       signer.names.dateHeader: V4Signer.timestamp(now), signer.names.payloadHeader: payload]
         for (k, v) in extra { headers[k.lowercased()] = v }
         var request = URLRequest(url: url)
         request.httpMethod = method
         for (k, v) in headers where k != "host" { request.setValue(v, forHTTPHeaderField: k) }
         request.setValue(signer.authorization(method: method, path: path, query: query, headers: headers,
                                               payloadHash: payload, date: now), forHTTPHeaderField: "Authorization")
-        if case .data(let d) = body {
+        switch body {
+        case .none: break
+        case .data(let d):
             request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
             request.httpBody = d
+        case .file:
+            request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         }
-        if case .file = body { request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type") }
 
         let done = DispatchSemaphore(value: 0)
         var result: Result<Response, Error> = .failure(StorageError.offline("no answer"))
         func finish(_ data: Data?, _ response: URLResponse?, _ error: Error?) {
             if let error {
-                result = .failure(S3Storage.classify(error))
+                result = .failure(GCSStorage.classify(error))
             } else if let http = response as? HTTPURLResponse {
                 var h: [String: String] = [:]
                 for (k, v) in http.allHeaderFields { h[String(describing: k).lowercased()] = String(describing: v) }
@@ -153,16 +191,17 @@ public final class S3Storage: ObjectStorage {
         let task: URLSessionTask
         if let saveTo {
             task = session.downloadTask(with: request) { tmp, response, error in
-                var data: Data?
-                if let tmp, let http = response as? HTTPURLResponse {
-                    if (200..<300).contains(http.statusCode) {
-                        try? FileManager.default.removeItem(at: saveTo)
-                        do { try FileManager.default.moveItem(at: tmp, to: saveTo) } catch { data = nil }
-                    } else {
-                        data = try? Data(contentsOf: tmp)
-                    }
+                guard error == nil, let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                    return finish(tmp.flatMap { try? Data(contentsOf: $0) }, response, error)
                 }
-                finish(data, response, error)
+                do {
+                    guard let tmp else { throw StorageError.failed("nothing arrived") }
+                    try? FileManager.default.removeItem(at: saveTo)
+                    try FileManager.default.moveItem(at: tmp, to: saveTo)
+                    finish(nil, response, nil)
+                } catch {
+                    finish(nil, nil, StorageError.failed("Cannot save a download: \(error)"))
+                }
             }
         } else if case .file(let file) = body {
             task = session.uploadTask(with: request, fromFile: file) { finish($0, $1, $2) }
@@ -173,17 +212,26 @@ public final class S3Storage: ObjectStorage {
         done.wait()
         let response = try result.get()
         if (200..<300).contains(response.status) { return response }
-        throw S3Storage.failure(response)
+        throw GCSStorage.failure(response)
     }
 
     static func classify(_ error: Error) -> StorageError {
+        if let e = error as? StorageError { return e }
         let offline: Set<URLError.Code> = [
             .notConnectedToInternet, .networkConnectionLost, .timedOut, .cannotFindHost, .cannotConnectToHost,
             .dnsLookupFailed, .internationalRoamingOff, .dataNotAllowed, .secureConnectionFailed,
-            .serverCertificateUntrusted, .serverCertificateHasBadDate, .serverCertificateNotYetValid,
             .cannotLoadFromNetwork, .callIsActive,
         ]
+        // Not "offline": someone may be intercepting the connection (or it's a captive portal),
+        // and that should show as a problem.
+        let untrusted: Set<URLError.Code> = [
+            .serverCertificateUntrusted, .serverCertificateHasBadDate, .serverCertificateNotYetValid,
+            .serverCertificateHasUnknownRoot, .clientCertificateRejected, .clientCertificateRequired,
+        ]
         if let u = error as? URLError, offline.contains(u.code) { return .offline(u.localizedDescription) }
+        if let u = error as? URLError, untrusted.contains(u.code) {
+            return .failed("The storage's certificate isn't trusted, so nothing was sent (\(u.localizedDescription))")
+        }
         return .failed(error.localizedDescription)
     }
 
@@ -194,13 +242,17 @@ public final class S3Storage: ObjectStorage {
         switch r.status {
         case 404: return .notFound
         case 401, 403: return .denied(text)
+        case 412: return .conflict
         case 500...599, 408, 429: return .offline(text) // the service is having trouble: just retry later
         default: return .failed(text)
         }
     }
 
-    static func etag(_ r: Response) -> String {
-        (r.headers["etag"] ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+    static func generation(_ r: Response) throws -> String {
+        guard let g = r.headers["x-goog-generation"], !g.isEmpty else {
+            throw StorageError.failed("The storage didn't say which version it stored")
+        }
+        return g
     }
 
     public func list(prefix: String) throws -> [StoredObject] {
@@ -209,8 +261,7 @@ public final class S3Storage: ObjectStorage {
         while true {
             var query = [("prefix", prefix)]
             if !marker.isEmpty { query.append(("marker", marker)) }
-            let r = try send("GET", key: nil, query: query)
-            let page = ListParser.parse(r.body)
+            let page = try ListParser.parse(try send("GET", key: nil, query: query).body)
             out += page.objects
             guard page.truncated, let last = page.nextMarker ?? page.objects.last?.key, last != marker else { break }
             marker = last
@@ -218,28 +269,27 @@ public final class S3Storage: ObjectStorage {
         return out
     }
 
-    public func get(_ key: String, range: ClosedRange<Int64>?) throws -> Data {
+    public func get(_ key: String, range: ClosedRange<Int64>?, version: String?) throws -> Data {
         var extra: [String: String] = [:]
         if let range { extra["range"] = "bytes=\(range.lowerBound)-\(range.upperBound)" }
+        if let version { extra[GCSStorage.precondition] = version }
         return try send("GET", key: key, extra: extra).body
     }
 
-    public func download(_ key: String, to file: URL) throws -> String {
-        S3Storage.etag(try send("GET", key: key, saveTo: file))
+    /// With `version`, Google sends nothing unless the object is still that generation.
+    public func download(_ key: String, to file: URL, version: String?) throws -> String {
+        var extra: [String: String] = [:]
+        if let version { extra[GCSStorage.precondition] = version }
+        return try GCSStorage.generation(send("GET", key: key, extra: extra, saveTo: file))
     }
 
-    public func put(_ key: String, data: Data) throws -> String {
-        S3Storage.etag(try send("PUT", key: key, body: .data(data)))
+    /// Version nil becomes generation 0: Google's way of saying "only if it doesn't exist yet".
+    public func put(_ key: String, data: Data, replacing version: String?) throws -> String {
+        try GCSStorage.generation(send("PUT", key: key, extra: [GCSStorage.precondition: version ?? "0"], body: .data(data)))
     }
 
-    public func upload(_ key: String, from file: URL) throws -> String {
-        S3Storage.etag(try send("PUT", key: key, body: .file(file)))
-    }
-
-    public func delete(_ key: String) throws {
-        do {
-            _ = try send("DELETE", key: key)
-        } catch StorageError.notFound {}
+    public func upload(_ key: String, from file: URL, replacing version: String?) throws -> String {
+        try GCSStorage.generation(send("PUT", key: key, extra: [GCSStorage.precondition: version ?? "0"], body: .file(file)))
     }
 }
 
@@ -282,22 +332,24 @@ enum ListParser {
         var nextMarker: String?
     }
 
-    static func parse(_ data: Data) -> Page {
+    static func parse(_ data: Data) throws -> Page {
         let parser = XMLParser(data: data)
         let d = Delegate()
         parser.delegate = d
-        parser.parse()
+        guard parser.parse() else { throw StorageError.failed("The storage sent a listing that doesn't parse") }
+        guard !d.missingGeneration else { throw StorageError.failed("The storage listing has no object generations") }
         return d.page
     }
 
     final class Delegate: NSObject, XMLParserDelegate {
         var page = Page()
+        var missingGeneration = false
         var inContents = false
         var text = ""
-        var key = "", size: Int64 = 0, etag = ""
+        var key = "", size: Int64 = 0, generation = ""
         func parser(_ p: XMLParser, didStartElement e: String, namespaceURI: String?, qualifiedName: String?,
                     attributes: [String: String] = [:]) {
-            if e == "Contents" { inContents = true; key = ""; size = 0; etag = "" }
+            if e == "Contents" { inContents = true; key = ""; size = 0; generation = "" }
             text = ""
         }
         func parser(_ p: XMLParser, foundCharacters s: String) { text += s }
@@ -305,10 +357,11 @@ enum ListParser {
             switch e {
             case "Key" where inContents: key = text
             case "Size" where inContents: size = Int64(text) ?? 0
-            case "ETag" where inContents: etag = text.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            case "Generation" where inContents: generation = text
             case "Contents":
                 inContents = false
-                page.objects.append(StoredObject(key: key, size: size, etag: etag))
+                if generation.isEmpty { missingGeneration = true }
+                page.objects.append(StoredObject(key: key, size: size, version: generation))
             case "IsTruncated": page.truncated = text == "true"
             case "NextMarker": page.nextMarker = text.isEmpty ? nil : text
             default: break

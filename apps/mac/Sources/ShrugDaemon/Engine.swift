@@ -14,11 +14,16 @@ struct LocalState: Codable {
     var profile: String?
     var links: [Link] = []
     var profileEditedAt: Date?
-    var profileETag: String?
+    /// The bucket version of the profile those links came from, or were uploaded as.
+    var profileVersion: String?
     var profileDirty = false
     var profileGen = 0
     /// Links Shrug placed on this Mac (path -> target), so it only ever removes its own.
     var recorded: [String: String] = [:]
+    /// Link paths you agreed to on this Mac (`shrug add`, or answering `shrug use`). A link
+    /// another Mac added is only placed once you have. Nil in state saved before this existed:
+    /// the links Shrug had placed (`recorded`) count as agreed to.
+    var approved: Set<String>?
     /// Things worth telling you about, like a link waiting for you to choose.
     var notices: [String] = []
     var profileNames: [String] = []
@@ -36,14 +41,23 @@ struct Session {
     let generation: Int
 }
 
+/// Unlocking needs the Shrug password: there's no Touch ID copy of the keys on this Mac.
+public struct PasswordNeeded: Error, CustomStringConvertible {
+    public var description: String { "Password needed" }
+}
+
 /// Owns the lock state and the rules around it.
 ///
 /// Locked: no keys, no bucket credentials and no file names in memory, and no
-/// contact with the storage. Shrug locks when the screen locks or the Mac sleeps. While
-/// locked, anything that needs a file asks Touch ID (or the Mac password) to unlock.
+/// contact with the storage. Shrug locks when the screen locks, the Mac sleeps or you switch
+/// to another user. While locked, anything that needs a file asks Touch ID (or the Mac
+/// password) to unlock.
 public final class Engine {
     public let paths: ShrugPaths
-    let touchID: TouchIDStore
+    let clock: Clock
+    let touchID: TouchIDKeyStore
+    let chip: ChipSeal
+    let screen: ScreenWatch
 
     /// Guards the state below. Never held while waiting for Touch ID or the network.
     let lock = NSRecursiveLock()
@@ -64,6 +78,8 @@ public final class Engine {
     private var previewers: [String: (Bool, Date)] = [:]
     private var passDue: Date?
     private var reconcileDue = false
+    /// What the screen showed at the last look while unlocked (see `checkScreen`).
+    private var lastScreen: ScreenState?
     var mounted = false
 
     var fs: VaultFS!
@@ -78,6 +94,12 @@ public final class Engine {
     /// Called on any state change; the menu bar redraws from `status()`.
     public var onChange: (() -> Void)?
 
+    /// Asks for the Shrug password when a program needs ~/Shrug and Touch ID can't unlock
+    /// (you chose the password, no fingerprint in reach, Touch ID not set up). Gets what the
+    /// program is doing; calls `done` once the question is closed, after unlocking if it was
+    /// answered. The menu bar app shows a dialog; without it, access is refused quietly.
+    public var askPassword: ((_ why: String, _ done: @escaping () -> Void) -> Void)?
+
     /// Seconds between passes over the bucket while unlocked (SHRUG_SYNC_SECONDS).
     let syncInterval: Int
     /// Quiet time after a change before it uploads, so one save is one upload (SHRUG_DEBOUNCE_SECONDS).
@@ -87,9 +109,13 @@ public final class Engine {
     /// the prompt it caused closes first instead of unlocking for nobody.
     let accessPromptTimeout: TimeInterval = 25
 
-    public init(paths: ShrugPaths) {
+    public init(paths: ShrugPaths, clock: Clock = .system, touchID: TouchIDKeyStore? = nil, chip: ChipSeal? = nil,
+                screen: ScreenWatch = .system) {
         self.paths = paths
-        touchID = TouchIDStore(url: paths.touchIDFile)
+        self.clock = clock
+        self.touchID = touchID ?? TouchIDStore(url: paths.touchIDFile)
+        self.chip = chip ?? SecureEnclaveSeal()
+        self.screen = screen
         let env = ProcessInfo.processInfo.environment
         syncInterval = max(1, Int(env["SHRUG_SYNC_SECONDS"].flatMap(Double.init) ?? 60))
         debounce = env["SHRUG_DEBOUNCE_SECONDS"].flatMap(Double.init) ?? 3
@@ -135,9 +161,14 @@ public final class Engine {
                                                            queue: nil) { [weak self] _ in
             self?.lockNow("Mac went to sleep")
         }))
+        observers.append((workspace, workspace.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification,
+                                                           object: nil, queue: nil) { [weak self] _ in
+            self?.lockNow("switched to another user")
+        }))
 
+        // The slack lets macOS wake for this together with other timers, which saves battery.
         let t = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "shrug.timer"))
-        t.schedule(deadline: .now() + 1, repeating: 1)
+        t.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(250))
         t.setEventHandler { [weak self] in self?.tick() }
         t.resume()
         timer = t
@@ -174,6 +205,13 @@ public final class Engine {
         lock.unlock()
         log(line ?? message)
         changed()
+    }
+
+    /// Something to tell you once. It stays in status and the menu until newer ones push it out.
+    func notify(_ note: String) {
+        updateState { st in
+            if !st.notices.contains(note) { st.notices = Array((st.notices + [note]).suffix(20)) }
+        }
     }
 
     // MARK: - State access
@@ -215,30 +253,24 @@ public final class Engine {
         return _unlocked ? _state : nil
     }
 
+    /// Changes the state and saves it before returning. The save happens under the lock, so
+    /// what's on disk is always the newest state.
     func updateState(_ body: (inout LocalState) -> Void) {
         lock.lock()
-        guard _unlocked, var s = _state, let key = _localKey else {
-            lock.unlock()
-            return
-        }
+        guard _unlocked, var s = _state, let key = _localKey else { return lock.unlock() }
         body(&s)
         _state = s
+        do { try Engine.writeState(s, paths, key: key) } catch { log("saving state failed: \(error)") }
         lock.unlock()
-        do { try Engine.writeState(s, to: paths.stateFile, key: key) } catch { log("saving state failed: \(error)") }
         changed()
     }
 
-    static let stateAAD = Data("shrug-state-v1".utf8)
-
-    static func writeState(_ s: LocalState, to url: URL, key: SymmetricKey) throws {
-        let sealed = try ShrugCrypto.seal(JSONFile.encode(s), key: ShrugCrypto.subkey(key, "shrug-state-v1"), aad: stateAAD)
-        try JSONFile.writeAtomically(sealed, to: url)
+    static func writeState(_ s: LocalState, _ paths: ShrugPaths, key: SymmetricKey) throws {
+        try SealedFile.state.write(JSONFile.encode(s), paths, key: key)
     }
 
-    static func readState(_ url: URL, key: SymmetricKey) throws -> LocalState {
-        guard let sealed = try? Data(contentsOf: url),
-              let plain = try? ShrugCrypto.open(sealed, key: ShrugCrypto.subkey(key, "shrug-state-v1"), aad: stateAAD)
-        else { throw ShrugError("Can't open this Mac's Shrug settings") }
+    static func readState(_ paths: ShrugPaths, key: SymmetricKey) throws -> LocalState {
+        guard let plain = try SealedFile.state.read(paths, key: key) else { throw ShrugError("This Mac's Shrug settings are missing") }
         return try JSONFile.decode(LocalState.self, from: plain)
     }
 
@@ -248,11 +280,14 @@ public final class Engine {
         guard paths.isSetUp else { throw ShrugError("Not set up yet: run ./setup") }
         if isUnlocked { return }
         guard let password else {
-            guard touchID.isEnrolled else { throw ShrugError("password-needed") }
+            guard touchID.isEnrolled else { throw PasswordNeeded() }
+            promptLock.lock()
+            defer { promptLock.unlock() }
+            if isUnlocked { return }
             try unlockWithTouchID(reason: "unlock your vault")
             return
         }
-        let keys = try JSONFile.load(LocalKeys.self, from: paths.keyringFile)
+        let keys = try loadKeys()
         let cache = KEKCache()
         let master = try keys.vault.open(password: password, cache: cache)
         let local = try keys.local.open(password: password, cache: cache)
@@ -262,23 +297,42 @@ public final class Engine {
         try opened(master, local)
     }
 
+    /// Throws PasswordNeeded when only the Shrug password can unlock now. A copy that can never
+    /// open again is removed, so the next password unlock makes a new one.
     func unlockWithTouchID(reason: String, timeout: TimeInterval = 60) throws {
-        let keys = try touchID.unlock(reason: reason, timeout: timeout)
-        guard keys.count == 64 else { throw ShrugError("Touch ID data is damaged") }
+        let keys: Data
+        do {
+            keys = try touchID.unlock(reason: reason, timeout: timeout)
+        } catch TouchIDError.invalidated {
+            touchID.remove()
+            log("the Touch ID copy of the keys no longer opens (fingerprints changed?): the password makes a new one")
+            throw PasswordNeeded()
+        } catch TouchIDError.usePassword {
+            throw PasswordNeeded()
+        }
+        guard keys.count == 64 else {
+            touchID.remove()
+            throw PasswordNeeded()
+        }
         try opened(SymmetricKey(data: keys.prefix(32)), SymmetricKey(data: keys.suffix(32)))
     }
 
-    /// Everything an unlock does once the keys are known.
+    /// Everything an unlock does once the keys are known. This Mac's files are brought to the
+    /// current format first; the vault follows in the first pass.
     func opened(_ master: SymmetricKey, _ local: SymmetricKey) throws {
-        let vault = VaultKeys(master: master)
-        let state = try Engine.readState(paths.stateFile, key: local)
-        let store = try Store(paths: paths, keys: vault, localKey: local)
-        let storage = try Storage.make(state.storage, state.credentials)
         lock.lock()
-        if _unlocked {
-            lock.unlock()
-            return
-        }
+        let already = _unlocked
+        lock.unlock()
+        if already { return }
+        let vault = VaultKeys(master: master)
+        try Migrations.upgradeLocal(paths, keys: vault, localKey: local, log: log)
+        let state = try Engine.readState(paths, key: local)
+        let store = try Store(paths: paths, keys: vault, localKey: local, clock: clock)
+        let storage = try Storage.make(state.storage, state.credentials)
+        let screenNow = screen.current()
+        lock.lock()
+        if _unlocked { return lock.unlock() }
+        lastScreen = screenNow
         _keys = vault
         _localKey = local
         _state = state
@@ -288,9 +342,57 @@ public final class Engine {
         generation += 1
         deniedUntil = nil
         reconcileDue = true
-        passDue = Date()
+        passDue = clock.now()
         lock.unlock()
         event("Unlocked")
+        protectKeys()
+    }
+
+    // MARK: - keyring.json
+
+    /// This Mac's keys, still wrapped with the Shrug password.
+    func loadKeys() throws -> LocalKeys {
+        switch try JSONFile.load(KeyringFile.self, from: paths.keyringFile) {
+        case .plain(let keys):
+            return keys
+        case .chip(let sealed):
+            guard chip.isAvailable, let plain = try? chip.open(sealed) else {
+                throw ShrugError("This Mac's security chip can't open ~/.shrug/keyring.json (was ~/.shrug copied from another Mac?). Move ~/.shrug away and run ./setup to join your vault again; files in local/ don't come back.")
+            }
+            return try JSONFile.decode(LocalKeys.self, from: plain)
+        }
+    }
+
+    /// Writes keyring.json, sealed by the security chip when this Mac has one.
+    func saveKeys(_ keys: LocalKeys) throws {
+        try JSONFile.save(sealedIfPossible(keys), to: paths.keyringFile)
+    }
+
+    /// If the chip fails, the password alone protects the keys, as on a Mac without one,
+    /// until an unlock seals them (see `protectKeys`).
+    private func sealedIfPossible(_ keys: LocalKeys) -> KeyringFile {
+        guard chip.isAvailable else { return .plain(keys) }
+        do {
+            return .chip(try chip.seal(JSONFile.encode(keys)))
+        } catch {
+            log("the security chip couldn't seal keyring.json, so only the Shrug password protects it for now: \(error)")
+            return .plain(keys)
+        }
+    }
+
+    /// Seals a keyring.json that isn't sealed yet: one from before Shrug used the chip, or
+    /// one written while the chip failed. Copies made before then (backups) stay as they were.
+    func protectKeys() {
+        guard chip.isAvailable, case .plain(let keys)? = try? JSONFile.load(KeyringFile.self, from: paths.keyringFile)
+        else { return }
+        let file = sealedIfPossible(keys)
+        guard case .chip = file else { return }
+        do {
+            try JSONFile.save(file, to: paths.keyringFile)
+            log("sealed keyring.json with this Mac's security chip")
+        } catch {
+            log("saving keyring.json failed: \(error)")
+        }
     }
 
     public func lockNow(_ reason: String) {
@@ -307,6 +409,7 @@ public final class Engine {
         globalEpoch += 1 // makes the kernel drop cached contents on the next open
         passDue = nil
         previewers = [:]
+        lastScreen = nil
         lock.unlock()
         store?.close()
         fs.reset()
@@ -314,44 +417,81 @@ public final class Engine {
         if wasOpen { event("Locked: \(reason)") }
     }
 
-    /// For the virtual folder: unlock with Touch ID if possible, else refuse quietly.
+    /// For the virtual folder: unlock with Touch ID if possible, else with the Shrug password
+    /// if the menu bar app can ask for it, else refuse quietly.
     /// The NFS request doesn't say which program sent it, so the prompt can't either:
     /// "Shrug is trying to unlock because a program is <doing> <path>."
     func unlockForAccess(_ doing: String, _ path: String) -> Bool {
         if isUnlocked { return true }
-        guard !refusing, touchID.isEnrolled else { return false }
+        guard !refusing, touchID.isEnrolled || askPassword != nil else { return false }
         promptLock.lock()
         defer { promptLock.unlock() }
         if isUnlocked { return true }
         // Waited behind a prompt that was just cancelled: don't ask again right away.
         if refusing { return false }
+        // The program gives up after about 30 seconds, whichever way it's asked.
+        let deadline = Date().addingTimeInterval(accessPromptTimeout)
+        let why = "a program is \(doing) \(Engine.shown(path))"
         do {
-            try unlockWithTouchID(reason: "unlock because a program is \(doing) \(path)", timeout: accessPromptTimeout)
+            guard touchID.isEnrolled else { throw PasswordNeeded() }
+            try unlockWithTouchID(reason: "unlock because \(why)", timeout: accessPromptTimeout)
             return true
-        } catch {
-            lock.lock()
-            deniedUntil = Date().addingTimeInterval(denyCooldown)
-            lock.unlock()
-            event("Stayed locked: a program was \(doing) \(path)", log: "stayed locked")
-            return false
+        } catch is PasswordNeeded {
+            if passwordUnlock(why, until: deadline) { return true }
+        } catch {}
+        lock.lock()
+        deniedUntil = clock.now().addingTimeInterval(denyCooldown)
+        lock.unlock()
+        event("Stayed locked: \(why)", log: "stayed locked")
+        return false
+    }
+
+    /// Asks for the Shrug password (see `askPassword`) and waits for the answer, but not past
+    /// `deadline`. An answer that comes later still unlocks, for the program's next try.
+    private func passwordUnlock(_ why: String, until deadline: Date) -> Bool {
+        guard let ask = askPassword else { return false }
+        let closed = DispatchSemaphore(value: 0)
+        ask(why) { closed.signal() }
+        _ = closed.wait(timeout: .now() + max(1, deadline.timeIntervalSinceNow))
+        return isUnlocked
+    }
+
+    /// A path as it may appear in a system prompt. Names come from whatever program asked, so
+    /// control and formatting characters (line breaks, right-to-left overrides) become "?",
+    /// and long ones are shortened in the middle.
+    static func shown(_ path: String, limit: Int = 80) -> String {
+        var scalars = String.UnicodeScalarView()
+        for s in path.unicodeScalars {
+            switch s.properties.generalCategory {
+            case .control, .format, .lineSeparator, .paragraphSeparator, .privateUse, .surrogate, .unassigned:
+                scalars.append("?")
+            default:
+                scalars.append(s)
+            }
         }
+        let clean = String(scalars)
+        guard clean.count > limit else { return clean }
+        return String(clean.prefix(limit / 2 - 1)) + "…" + String(clean.suffix(limit / 2))
     }
 
     private var refusing: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return deniedUntil.map { $0 > Date() } ?? false
+        return deniedUntil.map { $0 > clock.now() } ?? false
     }
 
-    /// For commands: immediate when unlocked, otherwise one Touch ID prompt.
+    /// For commands: immediate when unlocked, otherwise one Touch ID prompt. PasswordNeeded
+    /// when only the Shrug password can unlock (the command line then asks for it).
     func requireUnlocked(_ reason: String) throws {
         if isUnlocked { return }
-        guard touchID.isEnrolled else { throw ShrugError("Shrug is locked: run 'shrug unlock' first") }
+        guard touchID.isEnrolled else { throw PasswordNeeded() }
         promptLock.lock()
         defer { promptLock.unlock() }
         if isUnlocked { return }
         do {
             try unlockWithTouchID(reason: reason)
+        } catch let e as PasswordNeeded {
+            throw e
         } catch {
             throw ShrugError("Shrug stayed locked: \(error)")
         }
@@ -363,7 +503,7 @@ public final class Engine {
     /// otherwise download every remote/ file you browse past.
     func isPreviewer(reading path: String) -> Bool {
         lock.lock()
-        if let (answer, at) = previewers[path], Date().timeIntervalSince(at) < 10 {
+        if let (answer, at) = previewers[path], clock.now().timeIntervalSince(at) < 10 {
             lock.unlock()
             return answer
         }
@@ -373,7 +513,7 @@ public final class Engine {
         let previewer = ["Finder", "QuickLook", "com.apple.quicklook", "quicklookd", "mds", "mdworker", "Thumbnail",
                          "iconservices"].contains { name.hasPrefix($0) }
         lock.lock()
-        previewers[path] = (previewer, Date())
+        previewers[path] = (previewer, clock.now())
         lock.unlock()
         return previewer
     }
@@ -383,14 +523,14 @@ public final class Engine {
     /// Something in ~/Shrug changed: upload it shortly.
     func localChange() {
         lock.lock()
-        let soon = Date().addingTimeInterval(debounce + 0.5)
-        if passDue == nil || passDue! > soon { passDue = soon }
+        let soon = clock.now().addingTimeInterval(debounce + 0.5)
+        if passDue.map({ $0 > soon }) ?? true { passDue = soon }
         lock.unlock()
     }
 
     func passSoon() {
         lock.lock()
-        passDue = Date()
+        passDue = clock.now()
         lock.unlock()
     }
 
@@ -400,13 +540,38 @@ public final class Engine {
         lock.unlock()
     }
 
+    /// Locks if the screen locked, or you switched to another user, since the last look. The
+    /// notifications in `start` normally get there first; this catches one that never came.
+    /// Only a change counts, so unlocking on purpose while the screen is locked (over SSH, say)
+    /// still works, as before.
+    func checkScreen() {
+        lock.lock()
+        let unlocked = _unlocked
+        let gen = generation
+        lock.unlock()
+        guard unlocked, let now = screen.current() else { return }
+        lock.lock()
+        // Locked, or locked and unlocked again, while asking: that unlock has its own baseline.
+        guard _unlocked, generation == gen else { return lock.unlock() }
+        let before = lastScreen
+        lastScreen = now
+        lock.unlock()
+        guard let before else { return }
+        if now.locked && !before.locked {
+            lockNow("screen locked")
+        } else if before.ours && !now.ours {
+            lockNow("switched to another user")
+        }
+    }
+
     func tick() {
         ticks += 1
+        checkScreen()
         lock.lock()
         let store = _unlocked ? _store : nil
         var runPass = false
         if _unlocked {
-            if let due = passDue, due <= Date() { runPass = true; passDue = nil }
+            if let due = passDue, due <= clock.now() { runPass = true; passDue = nil }
             if ticks % syncInterval == 0 { runPass = true }
         }
         let runReconcile = _unlocked && (reconcileDue || ticks % 60 == 0)

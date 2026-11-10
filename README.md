@@ -13,12 +13,12 @@ Shrug keeps your SSH keys, kubeconfigs, API tokens and other private files encry
 Shrug stores its data in `~/.shrug`. You open and edit your files in `~/Shrug`, which has three folders:
 
 - `synced/` is for files you need on every computer, even offline.
-- `remote/` is for files that shouldn't be stored on any computer. They stay in the bucket and are only held in memory while you use them.
+- `remote/` is for files that shouldn't be stored on any computer. They stay in the bucket and are only kept on the computer while you use them.
 - `local/` is for files that should never leave this computer.
 
 Shrug puts links at the paths your tools already use. Your SSH key can be in `~/Shrug/synced/ssh/id_ed25519`, and `~/.ssh/id_ed25519` is a link to it.
 
-All files are encrypted on the computer and in the bucket. Shrug locks when the screen locks or the computer sleeps. `~/Shrug` then looks empty, and opening a file prompts for your fingerprint or password.
+All files are encrypted on the computer and in the bucket. Shrug locks when the screen locks, the computer sleeps or you switch to another user. `~/Shrug` then looks empty, and opening a file prompts for your fingerprint or Shrug password.
 
 ## Profiles
 
@@ -35,7 +35,7 @@ Shrug doesn't protect copies that apps make on their own, such as autosaves, pre
 
 ## Setup
 
-Create a Google Cloud Storage bucket and a service account with the Storage Object User role on it. Then run `./setup` on each computer.
+Create a Google Cloud Storage bucket and a service account with the Storage Object User role on it. Then run `./setup` on each computer. To update, pull the latest version and run `./setup` again.
 
 ## Usage
 
@@ -50,7 +50,7 @@ Create a Google Cloud Storage bucket and a service account with the Storage Obje
 
 By default, `shrug add` uses the file's path relative to your home folder, minus the leading dot so it isn't hidden. Add `--remote` or `--local` to put the file in that folder instead of `synced/`.
 
-If an app replaces a link with a real file when saving, Shrug moves the new file into `~/Shrug` and puts the link back. If a file already exists where a link should go, Shrug asks which version to keep and deletes the other.
+If an app replaces a link with a real file when saving, Shrug moves the new file into `~/Shrug` and puts the link back. If a file or another link already exists where a link should go, Shrug asks which version to keep and deletes the other.
 
 Deleting or moving a file at its usual path, like `rm ~/.kube/config`, removes only the link. The file stays at `~/Shrug/synced/kube/config`, and nothing in `~/.shrug` is deleted. Other Macs that follow the same profile lose the link too.
 

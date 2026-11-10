@@ -21,6 +21,8 @@ let package = Package(
         .executableTarget(name: "shrug", dependencies: ["ShrugCore"]),
         .testTarget(name: "ShrugCoreTests", dependencies: ["ShrugCore"]),
         .testTarget(name: "ShrugNFSTests", dependencies: ["ShrugNFS"]),
-        .testTarget(name: "ShrugDaemonTests", dependencies: ["ShrugDaemon", "ShrugCore", "ShrugNFS"]),
+        // Fixtures: data in older formats, for the migration tests.
+        .testTarget(name: "ShrugDaemonTests", dependencies: ["ShrugDaemon", "ShrugCore", "ShrugNFS"],
+                    resources: [.copy("Fixtures")]),
     ]
 )

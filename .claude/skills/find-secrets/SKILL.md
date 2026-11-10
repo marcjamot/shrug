@@ -42,7 +42,8 @@ recommendation. The user is a developer; keep the report brief.
 
 ## Recommendations
 
-- **Move to Shrug:** small files programs read from a fixed path. `shrug add <path>`
+- **Move to Shrug:** small files programs read from a fixed path in the home folder
+  (Shrug doesn't link anything outside it, or in `~/Library/LaunchAgents`). `shrug add <path>`
   moves the file into `~/Shrug/synced/` and links it; by default it keeps the path's
   shape (`~/.kube/config` -> `synced/kube/config`). Suggest a clearer place when it
   helps (`synced/work/kubeconfig`). The link joins this Mac's profile, so every Mac

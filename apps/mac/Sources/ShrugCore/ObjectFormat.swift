@@ -52,7 +52,8 @@ public struct ObjectHeader: Codable, Equatable, Sendable {
     public var mtime: Date
     public var size: Int64
     public var mode: UInt16
-    /// Hex of the content's file id, which binds the content to this header.
+    /// Hex of the content's file id (nil for empty content), which binds the content to this
+    /// header: a download is only used if its content has exactly this id and size.
     public var fileID: String?
 
     public init(path: String, kind: ObjectKind, editedAt: Date, mtime: Date, size: Int64, mode: UInt16, fileID: String?) {
@@ -81,6 +82,11 @@ public enum ObjectFormat {
     static func u32(_ v: Int) -> Data { withUnsafeBytes(of: UInt32(v).bigEndian) { Data($0) } }
 
     static func aad(_ objectKey: String) -> Data { Data("shrug-object:\(objectKey)".utf8) }
+
+    /// The exact size of a complete file object whose content is `plainSize` bytes.
+    public static func objectSize(plainSize: Int64) -> Int64 {
+        contentOffset + EncFormat.encryptedSize(plainSize: plainSize)
+    }
 
     /// The start of a new local copy, with an empty header slot.
     public static func blankPrefix() -> Data { magic + u32(slotSize) + Data(count: slotSize) }
@@ -121,5 +127,20 @@ public enum ObjectFormat {
         let h = try FileHandle(forReadingFrom: url)
         defer { try? h.close() }
         return try decodeHeader(h.readData(ofLength: Int(contentOffset)), keys: keys, objectKey: objectKey)
+    }
+
+    /// Reads and checks a whole object, such as a download: its header must open under
+    /// `objectKey` and name the path that key belongs to, and a file's content must be exactly
+    /// the content that header describes, every chunk intact.
+    public static func verifiedHeader(of url: URL, keys: VaultKeys, objectKey: String) throws -> ObjectHeader {
+        let h = try readHeader(of: url, keys: keys, objectKey: objectKey)
+        guard keys.objectKey(h.path) == objectKey else { throw ShrugError("An object claims another file's name") }
+        guard h.kind == .file else { return h }
+        let content = try EncryptedFile(url: url, master: keys.master, writable: false, base: contentOffset)
+        guard content.matches(fileID: h.fileID, size: h.size) else {
+            throw ShrugError("An object's content doesn't match its header (damaged, or changed by the storage)")
+        }
+        try content.verify()
+        return h
     }
 }

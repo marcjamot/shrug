@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public enum JSONFile {
@@ -36,20 +37,27 @@ public enum JSONFile {
         try encoder.encode(value)
     }
 
-    /// Atomic write with owner-only permissions.
-    public static func save<T: Encodable>(_ value: T, to url: URL, mode: Int = 0o600) throws {
+    public static func save<T: Encodable>(_ value: T, to url: URL) throws {
         var data = try encoder.encode(value)
         data.append(0x0A)
-        try writeAtomically(data, to: url, mode: mode)
+        try writeAtomically(data, to: url)
     }
 
-    public static func writeAtomically(_ data: Data, to url: URL, mode: Int = 0o600) throws {
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let tmp = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).tmp")
-        guard FileManager.default.createFile(atPath: tmp.path, contents: data, attributes: [.posixPermissions: mode]) else {
-            throw ShrugError("Could not write \(url.lastPathComponent)")
+    /// Replaces `url` with `data` in one step, owner-only. The data reaches the disk before the
+    /// rename, so after a crash the file is either the old version or the new one, never a mix.
+    public static func writeAtomically(_ data: Data, to url: URL) throws {
+        let dir = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let tmp = dir.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+        let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard fd >= 0 else { throw ShrugError("Could not write \(url.lastPathComponent): \(String(cString: strerror(errno)))") }
+        var written = Descriptor.writeAll(fd, data) && fcntl(fd, F_FULLFSYNC) == 0
+        close(fd)
+        if written { written = rename(tmp.path, url.path) == 0 }
+        guard written else {
+            unlink(tmp.path)
+            throw ShrugError("Could not replace \(url.lastPathComponent): \(String(cString: strerror(errno)))")
         }
-        guard rename(tmp.path, url.path) == 0 else { throw ShrugError("Could not replace \(url.lastPathComponent)") }
     }
 }
 
@@ -68,6 +76,22 @@ public enum ISO8601 {
 
     public static func format(_ date: Date) -> String { fractional.string(from: date) }
     public static func parse(_ s: String) -> Date? { fractional.date(from: s) ?? plain.date(from: s) }
+}
+
+/// Where Shrug gets the time, so tests can control it.
+public struct Clock: Sendable {
+    public let now: @Sendable () -> Date
+
+    public init(_ now: @escaping @Sendable () -> Date) { self.now = now }
+
+    public static let system = Clock { Date() }
+
+    /// Rounded to what JSON keeps (milliseconds), so a time survives a round trip unchanged.
+    public var nowMs: Date { now().ms }
+}
+
+extension Date {
+    public var ms: Date { Date(timeIntervalSince1970: (timeIntervalSince1970 * 1000).rounded(.down) / 1000) }
 }
 
 /// One link: a path on this Mac that shows a file from ~/Shrug.
@@ -109,17 +133,18 @@ public struct DeviceRecord: Codable, Sendable {
 
 /// The bucket's `m/keyring`: the vault key, wrapped with the Shrug password.
 public struct VaultRecord: Codable, Sendable {
+    /// The vault's format (see Migrations).
     public var version: Int
     public var keyring: Keyring
 
-    public init(version: Int = 2, keyring: Keyring) {
+    public init(version: Int, keyring: Keyring) {
         self.version = version
         self.keyring = keyring
     }
 }
 
-/// `~/.shrug/keyring.json`: this Mac's copy of the vault keyring (so the password works
-/// offline) and its own local key, both wrapped with the Shrug password.
+/// This Mac's copy of the vault keyring (so the password works offline) and its own local
+/// key, both wrapped with the Shrug password.
 public struct LocalKeys: Codable, Sendable {
     public var vault: Keyring
     public var local: Keyring
@@ -130,9 +155,31 @@ public struct LocalKeys: Codable, Sendable {
     }
 }
 
-extension Date {
-    /// Rounded to what JSON keeps (milliseconds), so a time survives a round trip unchanged.
-    public var ms: Date { Date(timeIntervalSince1970: (timeIntervalSince1970 * 1000).rounded(.down) / 1000) }
+/// `~/.shrug/keyring.json`: the LocalKeys, sealed by this Mac's security chip as well
+/// (`{"chip": …}`) when it has one, or as they are (Macs without one, and installs from
+/// before the chip was used, until their next unlock).
+public enum KeyringFile: Codable, Sendable {
+    case plain(LocalKeys)
+    case chip(ChipSealed)
 
-    public static var nowMs: Date { Date().ms }
+    private enum CodingKeys: String, CodingKey { case chip }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let sealed = try c.decodeIfPresent(ChipSealed.self, forKey: .chip) {
+            self = .chip(sealed)
+        } else {
+            self = .plain(try LocalKeys(from: decoder))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        switch self {
+        case .plain(let keys):
+            try keys.encode(to: encoder)
+        case .chip(let sealed):
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(sealed, forKey: .chip)
+        }
+    }
 }

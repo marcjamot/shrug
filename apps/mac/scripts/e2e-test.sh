@@ -5,6 +5,10 @@
 #
 #   apps/mac/scripts/e2e-test.sh            # KEEP=1 keeps the folder afterwards
 #
+# LOCK_SCREEN=1 also really locks your screen, to check that Shrug locks with it. That needs
+# "Require password after screen saver begins or display is turned off" set to Immediately
+# (System Settings > Lock Screen). Unlock your Mac afterwards; the script carries on meanwhile.
+#
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 BIN="$HERE/.build/debug"
@@ -110,8 +114,8 @@ wait_for "second ~/Shrug mounted" 10 mounted "$T/mnt2"
 printf 'old key on mac2\n' >"$T/home2/.ssh/id_e2e"
 check "a wrong password is refused" refused answers "not the password at all\n" ctl2 setup --storage folder --path "$T/bucket" --device mac2 --profile work
 check "...and nothing is set up" test ! -e "$T/state2/keyring.json"
-# Its own ~/.ssh/id_e2e collides: answer "s" (keep Shrug's version).
-check "setup with the password, keeping Shrug's key" answers "$PW\ns\n" ctl2 setup --storage folder --path "$T/bucket" --device mac2 --profile work
+# It's asked to place mac1's links here ("y"); its own ~/.ssh/id_e2e collides: "s" (keep Shrug's).
+check "setup with the password, keeping Shrug's key" answers "$PW\ny\ns\n" ctl2 setup --storage folder --path "$T/bucket" --device mac2 --profile work
 check "its key is now the link" sh -c "[ -L '$T/home2/.ssh/id_e2e' ] && grep -q 'PRIVATE KEY e2e' '$T/home2/.ssh/id_e2e'"
 check "its own file was deleted" test ! -e "$T/home2/.ssh/id_e2e.before-shrug"
 check "synced/ files arrived" grep -q 'PRIVATE KEY e2e' "$T/mnt2/synced/drop.txt"
@@ -139,7 +143,18 @@ wait_for "the link follows" 10 sh -c "[ \"\$(readlink '$T/home1/.ssh/id_e2e')\" 
 check "...and still reads" grep -q 'PRIVATE KEY e2e' "$T/home1/.ssh/id_e2e"
 wait_for "...on mac2 too" 20 sh -c "[ \"\$(readlink '$T/home2/.ssh/id_e2e')\" = '$T/mnt2/synced/ssh/id_work' ]"
 
-echo "7. Quit"
+if [ "${LOCK_SCREEN:-0}" = 1 ]; then
+  echo "7. Screen lock (unlock your Mac when it's done)"
+  both_unlocked() { status1_has "Shrug:     unlocked" && status2_has "Shrug:     unlocked"; }
+  check "both are unlocked" both_unlocked
+  pmset displaysleepnow
+  wait_for "mac1 locks with the screen" 5 status1_has "Shrug:     locked"
+  wait_for "mac2 locks with the screen" 5 status2_has "Shrug:     locked"
+else
+  echo "7. Screen lock: skipped (LOCK_SCREEN=1 runs it, and locks your screen)"
+fi
+
+echo "8. Quit"
 kill "$D1" "$D2"
 wait "$D1" "$D2" 2>/dev/null
 D1=""; D2=""

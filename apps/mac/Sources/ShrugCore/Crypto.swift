@@ -35,6 +35,10 @@ public enum ShrugCrypto {
         return SymmetricKey(data: out)
     }
 
+    /// The most iterations a keyring may ask for. Far above what a second buys today (about
+    /// 3 million on an M2), and every keyring Shrug makes stays under it.
+    public static let maxIterations = 100_000_000
+
     /// Enough iterations for roughly one second on this machine, never fewer than 600k.
     public static func calibratedIterations() -> Int {
         #if DEBUG
@@ -45,7 +49,7 @@ public enum ShrugCrypto {
         #endif
         let rounds = CCCalibratePBKDF(
             CCPBKDFAlgorithm(kCCPBKDF2), 32, 16, CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256), 32, 1000)
-        return max(Int(rounds), 600_000)
+        return min(max(Int(rounds), 600_000), maxIterations)
     }
 
     /// AES-256-GCM, returns nonce | ciphertext | tag.
@@ -92,8 +96,20 @@ public struct Keyring: Codable, Equatable, Sendable {
 
     public var saltData: Data { Data(base64Encoded: salt) ?? Data() }
 
-    public func open(password: String, cache: KEKCache? = nil) throws -> SymmetricKey {
+    /// A keyring from the bucket is checked before any work is done for it: an odd one could
+    /// otherwise crash the derivation or keep it busy for hours.
+    func validate() throws {
         guard kdf == "pbkdf2-sha256" else { throw ShrugError("Unknown key derivation '\(kdf)'") }
+        guard (1...ShrugCrypto.maxIterations).contains(iterations) else {
+            throw ShrugError("The keyring asks for \(iterations) iterations, which Shrug never makes: it's damaged")
+        }
+        guard saltData.count == 16, Data(base64Encoded: wrappedKey) != nil else {
+            throw ShrugError("The keyring is damaged")
+        }
+    }
+
+    public func open(password: String, cache: KEKCache? = nil) throws -> SymmetricKey {
+        try validate()
         let kek = cache?.derive(password, salt: saltData, iterations: iterations)
             ?? ShrugCrypto.pbkdf2(password, salt: saltData, iterations: iterations)
         guard let wrapped = Data(base64Encoded: wrappedKey),

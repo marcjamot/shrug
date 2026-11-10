@@ -1,5 +1,17 @@
-# Build output
-apps/mac/.build/
+# Swift, Xcode and SourceKit-LSP output
+.build/
+.swiftpm/
+.index-build/
+DerivedData/
+xcuserdata/
+*.xcodeproj/
+*.profraw
+*.profdata
+
+# The built Shrug.app (scripts/build-app.sh)
 apps/mac/build/
-.DS_Store
+
+# Editors and macOS
 .vscode/
+.idea/
+.DS_Store

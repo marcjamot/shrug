@@ -1,6 +1,37 @@
+import CoreGraphics
 import Darwin
 import Foundation
 import ServiceManagement
+import ShrugCore
+
+/// What the screen shows, as far as Shrug's lock goes.
+public struct ScreenState: Equatable, Sendable {
+    /// The lock screen (or the login window) is up.
+    public var locked: Bool
+    /// This user is the one at the screen (false after switching to another user).
+    public var ours: Bool
+
+    public init(locked: Bool, ours: Bool) {
+        self.locked = locked
+        self.ours = ours
+    }
+}
+
+/// Where the engine asks what the screen shows, so tests can answer instead of macOS.
+public struct ScreenWatch: Sendable {
+    /// Nil when macOS doesn't say (outside a login session).
+    public let current: @Sendable () -> ScreenState?
+
+    public init(_ current: @escaping @Sendable () -> ScreenState?) { self.current = current }
+
+    /// Asks the window server: one quick call. The console key is documented; the locked key
+    /// isn't, but it's what the lock screen sets. Either one changing is enough to lock.
+    public static let system = ScreenWatch {
+        guard let info = CGSessionCopyCurrentDictionary() as? [String: Any] else { return nil }
+        return ScreenState(locked: info["CGSSessionScreenIsLocked"] as? Bool ?? false,
+                           ours: info[kCGSessionOnConsoleKey] as? Bool ?? true)
+    }
+}
 
 /// Mounting the virtual folder with the system NFS client.
 enum Mounter {
@@ -17,7 +48,7 @@ enum Mounter {
         // Never hide someone's files: only mount over an empty folder.
         if let existing = try? FileManager.default.contentsOfDirectory(atPath: url.path),
            !existing.filter({ $0 != ".DS_Store" && $0 != ".localized" }).isEmpty {
-            throw ShrugErrorD("\(url.path) already has files in it. Move them somewhere else, then start Shrug again.")
+            throw ShrugError("\(url.path) already has files in it. Move them somewhere else, then start Shrug again.")
         }
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o500])
         seal(url)
@@ -35,7 +66,7 @@ enum Mounter {
             "rsize=65536", "wsize=65536", "noquota", "nobrowse",
         ].joined(separator: ",")
         let r = try run("/sbin/mount_nfs", ["-o", options, "127.0.0.1:/", url.path])
-        guard r.code == 0 else { throw ShrugErrorD("Could not mount \(url.path): \(r.output)") }
+        guard r.code == 0 else { throw ShrugError("Could not mount \(url.path): \(r.output)") }
     }
 
     /// Without Shrug running, the mount point is an empty folder nobody can write into, so
@@ -67,29 +98,14 @@ enum Mounter {
     }
 }
 
-struct ShrugErrorD: Error, CustomStringConvertible {
-    let description: String
-    init(_ d: String) { description = d }
-}
-
-/// Finds which program has a file open, so the Touch ID prompt can say who is asking.
+/// Finds which program has a file open.
 enum ProcessFinder {
+    /// Who has `path` open, so the preview filter can tell Finder and Quick Look from other
+    /// programs. (The Touch ID prompt can't use it: a program looks a file up before opening it.)
     static func holder(of path: String) -> String? {
         let me = getpid()
-        let count = proc_listallpids(nil, 0)
-        guard count > 0 else { return nil }
-        var pids = [pid_t](repeating: 0, count: Int(count) + 32)
-        let got = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
-        guard got > 0 else { return nil }
-        for pid in pids.prefix(Int(got)) where pid > 0 && pid != me {
-            let size = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
-            guard size > 0 else { continue }
-            let n = Int(size) / MemoryLayout<proc_fdinfo>.stride
-            var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: n)
-            let filled = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, &fds, size)
-            guard filled > 0 else { continue }
-            for fd in fds.prefix(Int(filled) / MemoryLayout<proc_fdinfo>.stride)
-            where fd.proc_fdtype == UInt32(PROX_FDTYPE_VNODE) {
+        for pid in allPIDs() where pid != me {
+            for fd in descriptors(of: pid) where fd.proc_fdtype == UInt32(PROX_FDTYPE_VNODE) {
                 var info = vnode_fdinfowithpath()
                 let r = proc_pidfdinfo(pid, fd.proc_fd, PROC_PIDFDVNODEPATHINFO, &info,
                                        Int32(MemoryLayout<vnode_fdinfowithpath>.size))
@@ -99,6 +115,22 @@ enum ProcessFinder {
             }
         }
         return nil
+    }
+
+    private static func allPIDs() -> [pid_t] {
+        let count = proc_listallpids(nil, 0)
+        guard count > 0 else { return [] }
+        var pids = [pid_t](repeating: 0, count: Int(count) + 32)
+        let got = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
+        return got > 0 ? pids.prefix(Int(got)).filter { $0 > 0 } : []
+    }
+
+    private static func descriptors(of pid: pid_t) -> [proc_fdinfo] {
+        let size = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+        guard size > 0 else { return [] }
+        var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(size) / MemoryLayout<proc_fdinfo>.stride)
+        let filled = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, &fds, size)
+        return filled > 0 ? Array(fds.prefix(Int(filled) / MemoryLayout<proc_fdinfo>.stride)) : []
     }
 
     static func name(of pid: pid_t) -> String? {

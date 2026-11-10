@@ -20,18 +20,60 @@ enum AcceptStat: UInt32 {
 final class RPCServer {
     typealias Handler = (inout RPCCall, inout XDRWriter) -> AcceptStat
 
+    /// A WRITE carries at most 1 MiB (see FSINFO), plus a little framing.
+    static let maxRecord = (1 << 20) + (1 << 16)
+    /// The kernel needs one or two; anything past this is someone else.
+    static let maxConnections = 16
+
+    /// One client connection. The descriptor closes when the last user lets go (the thread
+    /// reading calls, or a call still being answered), so a late reply can never land on a
+    /// descriptor number the system has given to someone else meanwhile.
+    private final class Connection: @unchecked Sendable {
+        let fd: Int32
+        let writeLock = NSLock()
+        private let inflightLock = NSLock()
+        private var inflight: Set<UInt32> = []
+
+        init(_ fd: Int32) { self.fd = fd }
+        deinit { close(fd) }
+
+        /// False if a call with this xid is still running (a retransmission).
+        func begin(_ xid: UInt32) -> Bool {
+            inflightLock.lock()
+            defer { inflightLock.unlock() }
+            return inflight.insert(xid).inserted
+        }
+
+        func end(_ xid: UInt32) {
+            inflightLock.lock()
+            inflight.remove(xid)
+            inflightLock.unlock()
+        }
+
+        func send(_ data: Data) {
+            writeLock.lock()
+            defer { writeLock.unlock() }
+            data.withUnsafeBytes { raw in
+                var off = 0
+                while off < raw.count {
+                    let n = write(fd, raw.baseAddress! + off, raw.count - off)
+                    if n <= 0 { break }
+                    off += n
+                }
+            }
+        }
+    }
+
     private(set) var port: UInt16 = 0
-    private var listenFD: Int32 = -1
+    private var acceptor: AcceptLoop?
     private let handler: Handler
-    private let requireReservedPort: Bool
     private let queue = DispatchQueue(label: "shrug.nfs.calls", attributes: .concurrent)
     private let lock = NSLock()
-    private var connections: Set<Int32> = []
+    private var connections: [Int32: Connection] = [:]
     private var running = false
     var log: (String) -> Void = { _ in }
 
-    init(requireReservedPort: Bool, handler: @escaping Handler) {
-        self.requireReservedPort = requireReservedPort
+    init(handler: @escaping Handler) {
         self.handler = handler
     }
 
@@ -57,62 +99,44 @@ final class RPCServer {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
         }
         port = UInt16(bigEndian: bound.sin_port)
-        listenFD = fd
+        lock.lock()
         running = true
-        let t = Thread { [weak self] in self?.acceptLoop() }
-        t.name = "shrug.nfs.accept"
-        t.start()
+        lock.unlock()
+        acceptor = try AcceptLoop(listening: fd, name: "shrug.nfs.accept") { [weak self] client in
+            guard let self else { close(client); return }
+            self.accepted(client)
+        }
     }
 
     func stop() {
         lock.lock()
         running = false
-        let fds = connections
+        let open = Array(connections.values)
         connections.removeAll()
         lock.unlock()
-        if listenFD >= 0 {
-            shutdown(listenFD, SHUT_RDWR)
-            close(listenFD)
-            listenFD = -1
-        }
-        for fd in fds {
-            shutdown(fd, SHUT_RDWR)
-            close(fd)
-        }
+        acceptor?.stop()
+        // Wakes each connection's reader; the descriptor closes once nothing uses it.
+        for c in open { shutdown(c.fd, SHUT_RDWR) }
     }
 
-    private func acceptLoop() {
-        while true {
-            var peer = sockaddr_in()
-            var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-            let fd = withUnsafeMutablePointer(to: &peer) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { accept(listenFD, $0, &len) }
-            }
-            if fd < 0 {
-                lock.lock()
-                let stillRunning = running
-                lock.unlock()
-                if !stillRunning { return }
-                continue
-            }
-            let peerPort = UInt16(bigEndian: peer.sin_port)
-            // Only the kernel (root) can use ports below 1024, so this keeps other
-            // local users from talking to the server directly.
-            if requireReservedPort && peerPort >= 1024 {
-                log("refused NFS connection from unprivileged port \(peerPort)")
-                close(fd)
-                continue
-            }
-            var one: Int32 = 1
-            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
-            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-            lock.lock()
-            connections.insert(fd)
-            lock.unlock()
-            let t = Thread { [weak self] in self?.serve(fd) }
-            t.name = "shrug.nfs.conn"
-            t.start()
+    private func accepted(_ fd: Int32) {
+        lock.lock()
+        let full = connections.count >= RPCServer.maxConnections
+        let refuse = !running || full
+        let connection = refuse ? nil : Connection(fd)
+        if let connection { connections[fd] = connection }
+        lock.unlock()
+        guard let connection else {
+            if full { log("refused an NFS connection: too many open") }
+            close(fd)
+            return
         }
+        var one: Int32 = 1
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        let t = Thread { [weak self] in self?.serve(connection) }
+        t.name = "shrug.nfs.conn"
+        t.start()
     }
 
     private func readFull(_ fd: Int32, _ count: Int) -> Data? {
@@ -126,15 +150,12 @@ final class RPCServer {
         return out
     }
 
-    private func serve(_ fd: Int32) {
-        let writeLock = NSLock()
-        let inflightLock = NSLock()
-        var inflight: Set<UInt32> = []
+    private func serve(_ connection: Connection) {
+        let fd = connection.fd
         defer {
             lock.lock()
-            let mine = connections.remove(fd) != nil
+            if connections[fd] === connection { connections[fd] = nil }
             lock.unlock()
-            if mine { close(fd) }
         }
         while true {
             var record = Data()
@@ -144,14 +165,11 @@ final class RPCServer {
                 let v = mark.withUnsafeBytes { UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self)) }
                 last = v & 0x8000_0000 != 0
                 let len = Int(v & 0x7FFF_FFFF)
-                guard len <= 4 << 20, let frag = readFull(fd, len) else { return }
+                guard record.count + len <= RPCServer.maxRecord, let frag = readFull(fd, len) else { return }
                 record.append(frag)
             }
             guard var call = parseCall(record) else { continue }
-            inflightLock.lock()
-            let duplicate = !inflight.insert(call.xid).inserted
-            inflightLock.unlock()
-            if duplicate { continue } // a retransmission of something still running
+            guard connection.begin(call.xid) else { continue } // a retransmission of something still running
             queue.async { [handler] in
                 var body = XDRWriter()
                 let stat = handler(&call, &body)
@@ -171,19 +189,8 @@ final class RPCServer {
                 var framed = XDRWriter()
                 framed.u32(0x8000_0000 | UInt32(reply.data.count))
                 framed.append(reply)
-                writeLock.lock()
-                framed.data.withUnsafeBytes { raw in
-                    var off = 0
-                    while off < raw.count {
-                        let n = write(fd, raw.baseAddress! + off, raw.count - off)
-                        if n <= 0 { break }
-                        off += n
-                    }
-                }
-                writeLock.unlock()
-                inflightLock.lock()
-                inflight.remove(call.xid)
-                inflightLock.unlock()
+                connection.send(framed.data)
+                connection.end(call.xid)
             }
         }
     }

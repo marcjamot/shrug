@@ -4,105 +4,7 @@ import XCTest
 @testable import ShrugDaemon
 import ShrugNFS
 
-/// One Mac: an engine with its own ~/.shrug and home, driven through the virtual folder
-/// directly (no mount).
-final class Mac {
-    let engine: Engine
-    let paths: ShrugPaths
-    let ctx = NFSContext(uid: getuid(), gid: getgid())
-
-    init(_ root: URL, _ name: String) {
-        let dir = root.appendingPathComponent(name)
-        paths = ShrugPaths(state: dir.appendingPathComponent("state"), mount: dir.appendingPathComponent("mnt"),
-                          home: dir.appendingPathComponent("home"), socket: dir.appendingPathComponent("s").path)
-        try? FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
-        engine = Engine(paths: paths)
-    }
-
-    var fs: VaultFS { engine.fs }
-
-    func lookup(_ path: String) throws -> UInt64 {
-        var id = fs.rootID
-        for part in path.split(separator: "/") { id = try fs.lookup(id, String(part)).get() }
-        return id
-    }
-
-    func write(_ path: String, _ data: Data) throws {
-        let dir = try lookup(Store.parent(path))
-        let id: UInt64
-        if case .success(let existing) = fs.lookup(dir, Store.name(path)) {
-            id = existing
-            var a = NFSSetAttrs()
-            a.size = 0
-            try fs.setattr(id, a, ctx).get()
-        } else {
-            id = try fs.create(dir, Store.name(path), mode: 0o600, exclusive: true, ctx).get()
-        }
-        try fs.write(id, offset: 0, data: data, ctx).get()
-    }
-
-    func mkdirs(_ path: String) throws {
-        var dir = ""
-        for part in path.split(separator: "/").map(String.init) {
-            let parent = try lookup(dir)
-            dir = dir.isEmpty ? part : dir + "/" + part
-            if case .failure = fs.lookup(parent, part) { _ = try fs.mkdir(parent, part, mode: 0o700, ctx).get() }
-        }
-    }
-
-    func read(_ path: String) throws -> Data {
-        let id = try lookup(path)
-        let size = try fs.getattr(id).get().size
-        var out = Data()
-        while out.count < Int(size) {
-            let (chunk, eof) = try fs.read(id, offset: UInt64(out.count), count: 65536, ctx).get()
-            out.append(chunk)
-            if eof || chunk.isEmpty { break }
-        }
-        return out
-    }
-
-    func names(_ dir: String) throws -> [String] { try fs.readdir(try lookup(dir)).get().map(\.name) }
-
-    func sync() { engine.replicator.pass() }
-}
-
-final class EngineTests: XCTestCase {
-    var root: URL!
-    var bucket: URL!
-    let password = "correct horse battery staple"
-
-    override func setUpWithError() throws {
-        setenv("SHRUG_TEST_KDF_ITERATIONS", "1000", 1)
-        setenv("SHRUG_NO_TOUCHID", "1", 1)
-        setenv("SHRUG_DEBOUNCE_SECONDS", "0", 1)
-        root = FileManager.default.temporaryDirectory.appendingPathComponent("shrug-engine-\(UUID().uuidString)")
-        bucket = root.appendingPathComponent("bucket")
-        try FileManager.default.createDirectory(at: bucket, withIntermediateDirectories: true)
-    }
-
-    override func tearDown() {
-        try? FileManager.default.removeItem(at: root)
-    }
-
-    var storage: StorageConfig { StorageConfig(kind: "folder", path: bucket.path) }
-
-    /// The first Mac creates the vault; the second joins it with the password.
-    func twoMacs() throws -> (Mac, Mac) {
-        let a = Mac(root, "a")
-        _ = try a.engine.setup(storage, nil, password: password, deviceName: "a", create: true)
-        let b = Mac(root, "b")
-        _ = try b.engine.setup(storage, nil, password: password, deviceName: "b", create: false)
-        return (a, b)
-    }
-
-    func offline(_ body: () throws -> Void) rethrows {
-        let away = root.appendingPathComponent("bucket-away")
-        try? FileManager.default.moveItem(at: bucket, to: away)
-        defer { try? FileManager.default.moveItem(at: away, to: bucket) }
-        try body()
-    }
-
+final class EngineTests: ShrugTestCase {
     func testTopLevelIsFixed() throws {
         let (a, _) = try twoMacs()
         XCTAssertEqual(try a.names(""), [VaultFS.neverIndex, "local", "synced", "remote"])
@@ -115,7 +17,7 @@ final class EngineTests: XCTestCase {
         let (a, _) = try twoMacs()
         try a.write("synced/client-x-contract.txt", Data("secret terms".utf8))
         try a.write("local/notes.txt", Data("local only".utf8))
-        a.engine.store?.save()
+        a.sync()
         a.engine.lockNow("test")
 
         XCTAssertEqual(try a.names("synced"), [], "a locked folder looks empty")
@@ -131,12 +33,16 @@ final class EngineTests: XCTestCase {
                 XCTAssertNil(data.range(of: Data("secret terms".utf8)), rel)
             }
         }
-        let bucketFiles = FileManager.default.enumerator(atPath: bucket.path)!.allObjects as! [String]
-        XCTAssertFalse(bucketFiles.contains { $0.contains("client") })
+        for rel in FileManager.default.enumerator(atPath: bucket.path)!.allObjects as! [String] {
+            XCTAssertFalse(rel.contains("client"), rel)
+            if let data = try? Data(contentsOf: bucket.appendingPathComponent(rel)) {
+                XCTAssertNil(data.range(of: Data("secret terms".utf8)), rel)
+            }
+        }
 
         try a.engine.unlock(password: password)
-        XCTAssertEqual(try a.read("synced/client-x-contract.txt"), Data("secret terms".utf8))
-        XCTAssertEqual(try a.read("local/notes.txt"), Data("local only".utf8))
+        XCTAssertEqual(try a.text("synced/client-x-contract.txt"), "secret terms")
+        XCTAssertEqual(try a.text("local/notes.txt"), "local only")
     }
 
     func testSyncedFilesReachTheOtherMac() throws {
@@ -146,34 +52,37 @@ final class EngineTests: XCTestCase {
         try a.write("local/only-here.txt", Data("x".utf8))
         a.sync()
         b.sync()
-        XCTAssertEqual(try b.read("synced/work/kubeconfig"), Data("apiVersion: v1".utf8))
+        XCTAssertEqual(try b.text("synced/work/kubeconfig"), "apiVersion: v1")
         XCTAssertEqual(try b.names("local"), [], "local/ never leaves its Mac")
         XCTAssertEqual(b.engine.status().waiting, 0)
         a.sync()
         XCTAssertEqual(a.engine.status().macs, ["a", "b"])
     }
 
-    func testLastEditWins() throws {
-        let (a, b) = try twoMacs()
-        try a.write("synced/f.txt", Data("one".utf8))
-        a.sync()
-        b.sync()
-        // A edits while offline; B edits later, online.
-        try offline {
-            try a.write("synced/f.txt", Data("A, offline".utf8))
+    func testTheNewestEditWinsWhicheverMacSyncsFirst() throws {
+        for newerFirst in [true, false] {
+            let (a, b) = try twoMacs()
+            try a.write("synced/f.txt", Data("one".utf8))
             a.sync()
+            b.sync()
+            try offline {
+                try a.write("synced/f.txt", Data("A, older".utf8))
+                try b.write("synced/f.txt", Data("B, newer".utf8))
+            }
+            if newerFirst {
+                b.sync()
+                a.sync()
+            } else {
+                a.sync()
+                b.sync()
+                a.sync()
+            }
+            XCTAssertEqual(try a.text("synced/f.txt"), "B, newer")
+            XCTAssertEqual(try b.text("synced/f.txt"), "B, newer")
+            XCTAssertEqual(a.engine.status().waiting + b.engine.status().waiting, 0)
+            try FileManager.default.removeItem(at: root)
+            try FileManager.default.createDirectory(at: bucket, withIntermediateDirectories: true)
         }
-        usleep(5000)
-        try b.write("synced/f.txt", Data("B, later".utf8))
-        b.sync()
-        a.sync() // A is back: B's edit is newer, so it wins
-        XCTAssertEqual(try a.read("synced/f.txt"), Data("B, later".utf8))
-        // And a newer edit on A beats B's.
-        usleep(5000)
-        try a.write("synced/f.txt", Data("A, newest".utf8))
-        a.sync()
-        b.sync()
-        XCTAssertEqual(try b.read("synced/f.txt"), Data("A, newest".utf8))
     }
 
     func testDeletesAndRenamesReachTheOtherMac() throws {
@@ -182,15 +91,42 @@ final class EngineTests: XCTestCase {
         try a.write("synced/gone.txt", Data("y".utf8))
         a.sync()
         b.sync()
-        try a.fs.rename(3, "old.txt", 3, "new.txt", a.ctx).get()
-        try a.fs.remove(3, "gone.txt", a.ctx).get()
+        try a.rename("synced/old.txt", "synced/new.txt")
+        try a.remove("synced/gone.txt")
         a.sync()
         b.sync()
         XCTAssertEqual(try b.names("synced"), ["new.txt"])
-        XCTAssertEqual(try b.read("synced/new.txt"), Data("x".utf8))
+        XCTAssertEqual(try b.text("synced/new.txt"), "x")
         guard case .failure(.xdev) = a.fs.rename(3, "new.txt", 4, "new.txt", a.ctx) else {
             return XCTFail("moving between folders is a copy, not a rename")
         }
+    }
+
+    func testDeleteMarkersStayForGood() throws {
+        let (a, b) = try twoMacs()
+        try a.write("synced/gone.txt", Data("y".utf8))
+        a.sync()
+        try a.remove("synced/gone.txt")
+        a.sync()
+        time.advance(400 * 86400)
+        a.sync()
+        b.sync()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: object(a, "synced/gone.txt").path),
+                      "Shrug never removes an object, not even an old marker")
+        XCTAssertEqual(try b.names("synced"), [])
+    }
+
+    func testEveryUploadHasItsOwnFileID() throws {
+        let (a, _) = try twoMacs()
+        var ids: Set<String> = []
+        for version in ["one", "two", "two"] {
+            try a.write("synced/token", Data(version.utf8))
+            a.sync()
+            let h = try ObjectFormat.verifiedHeader(of: object(a, "synced/token"), keys: a.store.keys,
+                                                    objectKey: a.store.objectKey("synced/token"))
+            ids.insert(try XCTUnwrap(h.fileID))
+        }
+        XCTAssertEqual(ids.count, 3, "no two versions of a file share a key")
     }
 
     func testRemoteFilesStreamAndAreNotKept() throws {
@@ -198,7 +134,7 @@ final class EngineTests: XCTestCase {
         let big = bytes(300_000)
         try a.write("remote/video.bin", big)
         a.sync()
-        let key = String(a.engine.store!.objectKey("remote/video.bin").dropFirst(2))
+        let key = String(a.store.objectKey("remote/video.bin").dropFirst(2))
         XCTAssertFalse(FileManager.default.fileExists(atPath: a.paths.objectStore.appendingPathComponent(key).path),
                        "after uploading, the local copy is gone")
         XCTAssertEqual(try a.read("remote/video.bin"), big, "but it still reads, from the bucket")
@@ -209,7 +145,7 @@ final class EngineTests: XCTestCase {
         try b.write("remote/video.bin", Data("short".utf8))
         b.sync()
         a.sync()
-        XCTAssertEqual(try a.read("remote/video.bin"), Data("short".utf8))
+        XCTAssertEqual(try a.text("remote/video.bin"), "short")
     }
 
     func testOfflineSavesWaitAndThenUpload() throws {
@@ -224,52 +160,63 @@ final class EngineTests: XCTestCase {
         a.sync()
         XCTAssertEqual(a.engine.status().waiting, 0)
         b.sync()
-        XCTAssertEqual(try b.read("remote/draft.txt"), Data("written on a plane".utf8))
-        XCTAssertEqual(try b.read("synced/todo.txt"), Data("plane".utf8))
+        XCTAssertEqual(try b.text("remote/draft.txt"), "written on a plane")
+        XCTAssertEqual(try b.text("synced/todo.txt"), "plane")
     }
 
     func testWrongPasswordDoesNotJoin() throws {
-        let a = Mac(root, "a")
+        let a = mac("a")
         _ = try a.engine.setup(storage, nil, password: password, deviceName: "a", create: true)
-        let b = Mac(root, "b")
+        let b = mac("b")
         XCTAssertThrowsError(try b.engine.setup(storage, nil, password: "not the password", deviceName: "b", create: false))
         XCTAssertFalse(b.paths.isSetUp)
         XCTAssertThrowsError(try a.engine.setup(storage, nil, password: password, deviceName: "a", create: true),
                              "setting up twice is refused")
+        let c = mac("c")
+        XCTAssertThrowsError(try c.engine.setup(storage, nil, password: password, deviceName: "c", create: true),
+                             "a second vault can't replace the first")
+    }
+
+    func testAnyPasswordIsYoursToChoose() throws {
+        let a = mac("a")
+        _ = try a.engine.setup(storage, nil, password: "x", deviceName: "a", create: true)
+        a.engine.lockNow("test")
+        try a.engine.unlock(password: "x")
+        XCTAssertTrue(a.engine.isUnlocked)
     }
 
     func testProfilesPlaceLinksOnEveryMac() throws {
         let (a, b) = try twoMacs()
         guard case .done = try a.engine.use("work", choices: [:]) else { return XCTFail() }
-        let key = a.paths.home.appendingPathComponent(".ssh/id_test")
-        try FileManager.default.createDirectory(at: key.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data("PRIVATE KEY".utf8).write(to: key)
-        guard case .done = try a.engine.add(path: key.path, target: nil, cls: nil, choices: [:]) else { return XCTFail() }
-        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: key.path),
+        try a.putHome(".ssh/id_test", "PRIVATE KEY")
+        guard case .done = try a.engine.add(path: a.home(".ssh/id_test").path, target: nil, cls: nil, choices: [:]) else {
+            return XCTFail()
+        }
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: a.home(".ssh/id_test").path),
                        a.paths.mount.appendingPathComponent("synced/ssh/id_test").path)
-        XCTAssertEqual(try a.read("synced/ssh/id_test"), Data("PRIVATE KEY".utf8))
+        XCTAssertEqual(try a.text("synced/ssh/id_test"), "PRIVATE KEY")
         // A link to a file that doesn't exist yet creates it empty.
-        let env = a.paths.home.appendingPathComponent("project/.env")
+        let env = a.home("project/.env")
         _ = try a.engine.add(path: env.path, target: "synced/project/env", cls: nil, choices: [:])
         XCTAssertEqual(try a.read("synced/project/env"), Data())
         a.sync()
 
-        // B already has its own ~/.ssh/id_test: following "work" asks which to keep.
-        let bKey = b.paths.home.appendingPathComponent(".ssh/id_test")
-        try FileManager.default.createDirectory(at: bKey.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data("B's old key".utf8).write(to: bKey)
+        // Following "work" on B first asks to place A's links there at all.
+        try b.putHome(".ssh/id_test", "B's old key")
         b.sync()
-        guard case .collisions(let paths) = try b.engine.use("work", choices: [:]) else { return XCTFail("should ask") }
+        guard case .confirm(let asked) = try b.engine.use("work", choices: [:]) else { return XCTFail("should ask") }
+        XCTAssertEqual(asked.map(\.path), ["~/.ssh/id_test", "~/project/.env"])
+        // B already has its own ~/.ssh/id_test: then it asks which to keep.
+        guard case .collisions(let paths) = try follow(b) else { return XCTFail("should ask") }
         XCTAssertEqual(paths, ["~/.ssh/id_test"])
-        XCTAssertEqual(b.engine.found(bKey, "synced/ssh/id_test"), .file, "asking changes nothing")
-        guard case .done = try b.engine.use("work", choices: ["~/.ssh/id_test": .shrug]) else { return XCTFail() }
-        XCTAssertEqual(b.engine.found(bKey, "synced/ssh/id_test"), .ourLink)
-        XCTAssertEqual(try b.read("synced/ssh/id_test"), Data("PRIVATE KEY".utf8), "Shrug's key won")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: bKey.path + ".before-shrug"))
-        XCTAssertEqual(b.engine.found(b.paths.home.appendingPathComponent("project/.env"), "synced/project/env"), .ourLink)
+        XCTAssertEqual(b.engine.found(b.home(".ssh/id_test"), "synced/ssh/id_test"), .file, "asking changes nothing")
+        guard case .done = try follow(b, choices: ["~/.ssh/id_test": .shrug]) else { return XCTFail() }
+        XCTAssertEqual(b.engine.found(b.home(".ssh/id_test"), "synced/ssh/id_test"), .ourLink)
+        XCTAssertEqual(try b.text("synced/ssh/id_test"), "PRIVATE KEY", "Shrug's key won")
+        XCTAssertEqual(b.engine.found(b.home("project/.env"), "synced/project/env"), .ourLink)
 
         // A link change on B reaches A: the last change wins.
-        _ = try b.engine.remove(path: b.paths.home.appendingPathComponent("project/.env").path)
+        _ = try b.engine.remove(path: b.home("project/.env").path)
         b.sync()
         a.sync()
         a.engine.reconcile()
@@ -278,55 +225,45 @@ final class EngineTests: XCTestCase {
     }
 
     func testAdjustingPullsBackReplacedLinksAndWaitsOnOthers() throws {
-        let (a, b) = try twoMacs()
-        _ = try a.engine.use("work", choices: [:])
-        a.sync()
-        _ = try b.engine.use("work", choices: [:])
-        let cfg = a.paths.home.appendingPathComponent(".kube/config")
+        let (a, b) = try twoMacsFollowing()
+        let cfg = a.home(".kube/config")
         _ = try a.engine.add(path: cfg.path, target: nil, cls: nil, choices: [:])
         // A tool saves by replacing the link with a real file.
         unlink(cfg.path)
         try Data("new context".utf8).write(to: cfg)
         a.engine.reconcile()
         XCTAssertEqual(a.engine.found(cfg, "synced/kube/config"), .ourLink)
-        XCTAssertEqual(try a.read("synced/kube/config"), Data("new context".utf8))
+        XCTAssertEqual(try a.text("synced/kube/config"), "new context")
         a.sync()
 
-        // B follows "work" too, and has its own fresh ~/.kube/config. When the link arrives
-        // nobody is there to ask, so B's file is left alone (never pulled in over Shrug's,
-        // never deleted) and B is told once.
-        let bCfg = b.paths.home.appendingPathComponent(".kube/config")
-        try FileManager.default.createDirectory(at: bCfg.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data("fresh default".utf8).write(to: bCfg)
+        // B has its own fresh ~/.kube/config. When the link arrives nobody is there to ask, so
+        // B's file is left alone (never pulled in over Shrug's, never deleted) and B is told once.
+        try b.putHome(".kube/config", "fresh default")
         b.sync()
         b.engine.reconcile()
         b.engine.reconcile()
-        XCTAssertEqual(b.engine.found(bCfg, "synced/kube/config"), .file)
-        XCTAssertEqual(try Data(contentsOf: bCfg), Data("fresh default".utf8))
-        XCTAssertEqual(try b.read("synced/kube/config"), Data("new context".utf8))
+        XCTAssertEqual(b.engine.found(b.home(".kube/config"), "synced/kube/config"), .file)
+        XCTAssertEqual(try String(contentsOf: b.home(".kube/config"), encoding: .utf8), "fresh default")
+        XCTAssertEqual(try b.text("synced/kube/config"), "new context")
         XCTAssertEqual(b.engine.status().notices.count, 1, "told once, not every minute")
 
         // Following the profile again asks, and the version not chosen is deleted.
-        guard case .collisions(let paths) = try b.engine.use("work", choices: [:]) else { return XCTFail("should ask") }
+        guard case .collisions(let paths) = try follow(b) else { return XCTFail("should ask") }
         XCTAssertEqual(paths, ["~/.kube/config"])
-        guard case .done = try b.engine.use("work", choices: ["~/.kube/config": .shrug]) else { return XCTFail() }
-        XCTAssertEqual(b.engine.found(bCfg, "synced/kube/config"), .ourLink)
-        XCTAssertEqual(try b.read("synced/kube/config"), Data("new context".utf8))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: bCfg.path + ".before-shrug"))
+        guard case .done = try follow(b, choices: ["~/.kube/config": .shrug]) else { return XCTFail() }
+        XCTAssertEqual(b.engine.found(b.home(".kube/config"), "synced/kube/config"), .ourLink)
+        XCTAssertEqual(try b.text("synced/kube/config"), "new context")
     }
 
     func testDeletingALinkRemovesIt() throws {
-        let (a, b) = try twoMacs()
-        _ = try a.engine.use("work", choices: [:])
-        a.sync()
-        _ = try b.engine.use("work", choices: [:])
-        let cfg = a.paths.home.appendingPathComponent(".kube/config")
+        let (a, b) = try twoMacsFollowing()
+        let cfg = a.home(".kube/config")
         _ = try a.engine.add(path: cfg.path, target: nil, cls: nil, choices: [:])
         try a.write("synced/kube/config", Data("context".utf8))
         a.sync()
         b.sync()
-        b.engine.reconcile()
-        let bCfg = b.paths.home.appendingPathComponent(".kube/config")
+        try follow(b)
+        let bCfg = b.home(".kube/config")
         XCTAssertEqual(b.engine.found(bCfg, "synced/kube/config"), .ourLink)
 
         // Deleting the link is a `shrug remove`: it isn't put back, and the file stays in Shrug.
@@ -335,7 +272,7 @@ final class EngineTests: XCTestCase {
         a.engine.reconcile()
         XCTAssertEqual(a.engine.found(cfg, "synced/kube/config"), .nothing)
         XCTAssertFalse(a.engine.status().links.contains { $0.path == "~/.kube/config" })
-        XCTAssertEqual(try a.read("synced/kube/config"), Data("context".utf8))
+        XCTAssertEqual(try a.text("synced/kube/config"), "context")
         a.sync()
         b.sync()
         b.engine.reconcile()
@@ -346,30 +283,25 @@ final class EngineTests: XCTestCase {
         unlink(cfg.path)
         _ = try a.engine.add(path: cfg.path, target: nil, cls: nil, choices: [:])
         XCTAssertEqual(a.engine.found(cfg, "synced/kube/config"), .ourLink)
-        XCTAssertEqual(try a.read("synced/kube/config"), Data("context".utf8))
+        XCTAssertEqual(try a.text("synced/kube/config"), "context")
     }
 
     func testRenamingInShrugMovesTheLinkAndDeletingRemovesIt() throws {
-        let (a, b) = try twoMacs()
-        _ = try a.engine.use("work", choices: [:])
-        a.sync()
-        _ = try b.engine.use("work", choices: [:])
-        let cfg = a.paths.home.appendingPathComponent(".kube/config")
+        let (a, b) = try twoMacsFollowing()
+        let cfg = a.home(".kube/config")
         _ = try a.engine.add(path: cfg.path, target: nil, cls: nil, choices: [:])
         try a.write("synced/kube/config", Data("context".utf8))
         a.sync()
         b.sync()
-        b.engine.reconcile()
-        let bCfg = b.paths.home.appendingPathComponent(".kube/config")
+        try follow(b)
+        let bCfg = b.home(".kube/config")
 
         // Renaming the file, or its folder, in ~/Shrug: the link follows, on both Macs.
-        let kube = try a.lookup("synced/kube")
-        try a.fs.rename(kube, "config", kube, "work", a.ctx).get()
-        let synced = try a.lookup("synced")
-        try a.fs.rename(synced, "kube", synced, "k8s", a.ctx).get()
+        try a.rename("synced/kube/config", "synced/kube/work")
+        try a.rename("synced/kube", "synced/k8s")
         a.engine.reconcile()
         XCTAssertEqual(a.engine.found(cfg, "synced/k8s/work"), .ourLink)
-        XCTAssertEqual(try a.read("synced/k8s/work"), Data("context".utf8))
+        XCTAssertEqual(try a.text("synced/k8s/work"), "context")
         a.sync()
         b.sync()
         b.engine.reconcile()
@@ -377,16 +309,16 @@ final class EngineTests: XCTestCase {
         XCTAssertFalse(b.engine.status().notices.contains { $0.contains("replaced") }, "a move isn't a surprise")
 
         // Deleting the file in ~/Shrug: it's gone, and so is the link. Nothing comes back empty.
-        try a.fs.remove(try a.lookup("synced/k8s"), "work", a.ctx).get()
+        try a.remove("synced/k8s/work")
         a.engine.reconcile()
         XCTAssertEqual(a.engine.found(cfg, "synced/k8s/work"), .nothing)
         XCTAssertFalse(a.engine.status().links.contains { $0.path == "~/.kube/config" })
-        XCTAssertNil(a.engine.store?.entry("synced/k8s/work"))
+        XCTAssertNil(a.store.entry("synced/k8s/work"))
         a.sync()
         b.sync()
         b.engine.reconcile()
         XCTAssertEqual(b.engine.found(bCfg, "synced/k8s/work"), .nothing)
-        XCTAssertNil(b.engine.store?.entry("synced/k8s/work"))
+        XCTAssertNil(b.store.entry("synced/k8s/work"))
     }
 
     func testUnlockAgainWithPassword() throws {
@@ -396,10 +328,18 @@ final class EngineTests: XCTestCase {
         XCTAssertNil(a.engine.store)
         XCTAssertThrowsError(try a.engine.unlock(password: "wrong one"))
         try a.engine.unlock(password: password)
-        XCTAssertEqual(try a.read("synced/x"), Data("x".utf8))
+        XCTAssertEqual(try a.text("synced/x"), "x")
     }
-}
 
-func bytes(_ n: Int, seed: UInt8 = 7) -> Data {
-    Data((0..<n).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ Int(seed)) })
+    func testGrowingAFileFillsTheGapChunkByChunk() throws {
+        let (a, _) = try twoMacs()
+        try a.write("synced/f", Data("x".utf8))
+        let id = try a.lookup("synced/f")
+        var attrs = NFSSetAttrs()
+        attrs.size = 3 << 20
+        try a.fs.setattr(id, attrs, a.ctx).get()
+        XCTAssertEqual(try a.read("synced/f").count, 3 << 20, "a gap of several chunks fills with zeros")
+        XCTAssertEqual(try a.read("synced/f").prefix(1), Data("x".utf8))
+        XCTAssertEqual(a.fs.maxFileSize, 1 << 30)
+    }
 }

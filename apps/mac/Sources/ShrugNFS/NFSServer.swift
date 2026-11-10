@@ -5,7 +5,7 @@ import Foundation
 public enum NFSStat: UInt32, Error {
     case ok = 0, perm = 1, noent = 2, io = 5, acces = 13, exist = 17, xdev = 18, notdir = 20, isdir = 21
     case inval = 22, fbig = 27, nospc = 28, rofs = 30, nametoolong = 63, notempty = 66, stale = 70
-    case badhandle = 10001, notsupp = 10004, serverfault = 10006
+    case badhandle = 10001, badCookie = 10003, notsupp = 10004, serverfault = 10006
 }
 
 public struct NFSTime: Equatable, Sendable {
@@ -92,6 +92,8 @@ public struct NFSFSStat: Sendable {
 /// What the server needs from a file system. Ids are stable for the life of the mount.
 public protocol NFSFileSystem: AnyObject {
     var rootID: UInt64 { get }
+    /// No file grows past this; the server refuses anything beyond it before asking.
+    var maxFileSize: UInt64 { get }
     func parent(_ id: UInt64) -> UInt64
     func getattr(_ id: UInt64) -> Result<NFSAttr, NFSStat>
     func lookup(_ dir: UInt64, _ name: String) -> Result<UInt64, NFSStat>
@@ -109,31 +111,49 @@ public protocol NFSFileSystem: AnyObject {
 }
 
 /// MOUNT v3 and NFS v3 on one loopback TCP port.
+///
+/// Anyone on this Mac can connect, so every file handle carries a random secret, and the only
+/// way to learn it is the MOUNT call. That call is answered once, during Shrug's own mount.
+/// If something else got that answer first, Shrug's mount fails and the secret changes, so
+/// the handle it got is worthless. Once mounted, only the kernel knows the handles; it checks
+/// permissions for each local user and says who is asking, and only this user (and root) are
+/// served.
 public final class NFSServer {
     private let fs: NFSFileSystem
     private var rpc: RPCServer!
     private let writeVerifier = ShrugNFSRandom.bytes(8)
-    /// Part of every file handle. Without it no request can name a file, and the only
-    /// way to learn it is the MOUNT call, which is answered only while Shrug itself mounts.
-    private let handleSecret = ShrugNFSRandom.bytes(16)
     private let gate = NSLock()
-    private var mountWindow = false
+    private var handleSecret = ShrugNFSRandom.bytes(16)
+    private var mountPending = false
     /// Users whose requests are served (this user and root).
     public var allowedUIDs: Set<UInt32> = [getuid(), 0]
     public var log: (String) -> Void = { _ in }
 
-    /// Runs `body` (which runs mount_nfs) with the MOUNT call allowed.
-    public func whileMounting<T>(_ body: () throws -> T) rethrows -> T {
-        gate.lock(); mountWindow = true; gate.unlock()
-        defer { gate.lock(); mountWindow = false; gate.unlock() }
-        return try body()
-    }
-
     public var port: UInt16 { rpc.port }
 
-    public init(fs: NFSFileSystem, requireReservedPort: Bool = false) {
+    /// Runs `mount` (Shrug's own mount_nfs) with one MOUNT call allowed.
+    public func whileMounting(_ mount: () throws -> Void) throws {
+        gate.lock()
+        mountPending = true
+        gate.unlock()
+        defer {
+            gate.lock()
+            mountPending = false
+            gate.unlock()
+        }
+        do {
+            try mount()
+        } catch {
+            gate.lock()
+            handleSecret = ShrugNFSRandom.bytes(16)
+            gate.unlock()
+            throw error
+        }
+    }
+
+    public init(fs: NFSFileSystem) {
         self.fs = fs
-        self.rpc = RPCServer(requireReservedPort: requireReservedPort) { [unowned self] call, out in
+        self.rpc = RPCServer { [unowned self] call, out in
             self.dispatch(&call, &out)
         }
     }
@@ -169,10 +189,11 @@ public final class NFSServer {
         case 1: // MNT
             _ = try call.args.string(max: 1024)
             gate.lock()
-            let open = mountWindow
+            let allowed = mountPending
+            mountPending = false
             gate.unlock()
-            guard open else {
-                log("refused MOUNT outside Shrug's own mount")
+            guard allowed else {
+                log("refused a MOUNT call outside Shrug's own mount")
                 out.u32(13) // MNT3ERR_ACCES
                 return .success
             }
@@ -251,14 +272,29 @@ public final class NFSServer {
 
     // MARK: - Encoding helpers
 
+    private var secret: Data {
+        gate.lock()
+        defer { gate.unlock() }
+        return handleSecret
+    }
+
     private func handle(_ id: UInt64) -> Data {
-        withUnsafeBytes(of: id.bigEndian) { Data($0) } + handleSecret
+        withUnsafeBytes(of: id.bigEndian) { Data($0) } + secret
     }
 
     private func readHandle(_ a: inout XDRReader) throws -> UInt64? {
         let d = try a.opaque(max: 64)
-        guard d.count == 24, d.suffix(16) == handleSecret else { return nil }
+        guard d.count == 24, NFSServer.same(d.suffix(16), secret) else { return nil }
         return d.prefix(8).withUnsafeBytes { UInt64(bigEndian: $0.loadUnaligned(as: UInt64.self)) }
+    }
+
+    /// Compares in time that doesn't depend on where the bytes differ, so timing replies
+    /// can't reveal the secret a byte at a time.
+    static func same(_ a: Data, _ b: Data) -> Bool {
+        guard a.count == b.count else { return false }
+        var diff: UInt8 = 0
+        for (x, y) in zip(a, b) { diff |= x ^ y }
+        return diff == 0
     }
 
     private func fattr(_ attr: NFSAttr, _ out: inout XDRWriter) {
@@ -314,7 +350,7 @@ public final class NFSServer {
         return s
     }
 
-    private func validName(_ name: String) -> NFSStat? {
+    private static func validName(_ name: String) -> NFSStat? {
         if name.isEmpty || name == "." || name == ".." || name.contains("/") || name.contains("\0") { return .inval }
         if name.utf8.count > 255 { return .nametoolong }
         return nil
@@ -345,6 +381,11 @@ public final class NFSServer {
             wccEmpty(&out)
             return
         }
+        if let size = s.size, size > fs.maxFileSize {
+            out.u32(NFSStat.fbig.rawValue)
+            wcc(id, &out)
+            return
+        }
         let r = fs.setattr(id, s, ctx)
         if case .failure(let e) = r { out.u32(e.rawValue) } else { out.u32(0) }
         wcc(id, &out)
@@ -361,6 +402,7 @@ public final class NFSServer {
         let result: Result<UInt64, NFSStat>
         if name == "." { result = .success(dir) }
         else if name == ".." { result = .success(fs.parent(dir)) }
+        else if let bad = NFSServer.validName(name) { result = .failure(bad) }
         else { result = fs.lookup(dir, name) }
         switch result {
         case .success(let id):
@@ -402,6 +444,14 @@ public final class NFSServer {
             out.bool(false)
             return
         }
+        guard offset < fs.maxFileSize else {
+            out.u32(0)
+            postOpAttr(id, &out)
+            out.u32(0)
+            out.bool(true)
+            out.opaque(Data())
+            return
+        }
         switch fs.read(id, offset: offset, count: min(count, 1 << 20), ctx) {
         case .success(let (data, eof)):
             out.u32(0)
@@ -420,10 +470,15 @@ public final class NFSServer {
         let offset = try a.u64()
         _ = try a.u32() // count
         _ = try a.u32() // stable_how: we always write through
-        let data = try a.opaque(max: 4 << 20)
+        let data = try a.opaque(max: 1 << 20)
         guard let id else {
             out.u32(NFSStat.badhandle.rawValue)
             wccEmpty(&out)
+            return
+        }
+        guard offset <= fs.maxFileSize - UInt64(data.count) else {
+            out.u32(NFSStat.fbig.rawValue)
+            wcc(id, &out)
             return
         }
         switch fs.write(id, offset: offset, data: data, ctx) {
@@ -450,7 +505,7 @@ public final class NFSServer {
             wccEmpty(&out)
             return
         }
-        if let bad = validName(name) {
+        if let bad = NFSServer.validName(name) {
             out.u32(bad.rawValue)
             wcc(dir, &out)
             return
@@ -467,7 +522,7 @@ public final class NFSServer {
             wccEmpty(&out)
             return
         }
-        if let bad = validName(name) {
+        if let bad = NFSServer.validName(name) {
             out.u32(bad.rawValue)
             wcc(dir, &out)
             return
@@ -497,7 +552,8 @@ public final class NFSServer {
             wccEmpty(&out)
             return
         }
-        let r = directory ? fs.rmdir(dir, name, ctx) : fs.remove(dir, name, ctx)
+        let r: Result<Void, NFSStat> = NFSServer.validName(name).map { .failure($0) }
+            ?? (directory ? fs.rmdir(dir, name, ctx) : fs.remove(dir, name, ctx))
         if case .failure(let e) = r { out.u32(e.rawValue) } else { out.u32(0) }
         wcc(dir, &out)
     }
@@ -513,7 +569,8 @@ public final class NFSServer {
             wccEmpty(&out)
             return
         }
-        let r: Result<Void, NFSStat> = validName(toName).map { .failure($0) } ?? fs.rename(from, fromName, to, toName, ctx)
+        let r: Result<Void, NFSStat> = (NFSServer.validName(fromName) ?? NFSServer.validName(toName)).map { .failure($0) }
+            ?? fs.rename(from, fromName, to, toName, ctx)
         if case .failure(let e) = r { out.u32(e.rawValue) } else { out.u32(0) }
         wcc(from, &out)
         wcc(to, &out)
@@ -541,6 +598,11 @@ public final class NFSServer {
             postOpAttr(dir, &out)
         case .success(let listing):
             let all = [NFSDirEntry(name: ".", id: dir), NFSDirEntry(name: "..", id: fs.parent(dir))] + listing
+            guard cookie <= UInt64(all.count) else {
+                out.u32(NFSStat.badCookie.rawValue)
+                postOpAttr(dir, &out)
+                return
+            }
             out.u32(0)
             postOpAttr(dir, &out)
             out.fixed(Data(count: 8))
@@ -570,8 +632,14 @@ public final class NFSServer {
         }
     }
 
+    /// "Bad handle" with an empty post_op_attr: the failure body of FSSTAT, FSINFO and PATHCONF.
+    private func badHandleNoAttr(_ out: inout XDRWriter) {
+        out.u32(NFSStat.badhandle.rawValue)
+        out.bool(false)
+    }
+
     private func fsstat(_ a: inout XDRReader, _ out: inout XDRWriter) throws {
-        let id = try readHandle(&a)
+        guard let id = try readHandle(&a) else { return badHandleNoAttr(&out) }
         let s = fs.fsstat()
         out.u32(0)
         postOpAttr(id, &out)
@@ -585,7 +653,7 @@ public final class NFSServer {
     }
 
     private func fsinfo(_ a: inout XDRReader, _ out: inout XDRWriter) throws {
-        let id = try readHandle(&a)
+        guard let id = try readHandle(&a) else { return badHandleNoAttr(&out) }
         out.u32(0)
         postOpAttr(id, &out)
         out.u32(1 << 20) // rtmax
@@ -595,14 +663,14 @@ public final class NFSServer {
         out.u32(65536) // wtpref
         out.u32(4096) // wtmult
         out.u32(65536) // dtpref
-        out.u64(UInt64(Int64.max))
+        out.u64(fs.maxFileSize)
         out.u32(0)
         out.u32(1) // time_delta 1ns
         out.u32(0x08 | 0x10) // HOMOGENEOUS | CANSETTIME
     }
 
     private func pathconf(_ a: inout XDRReader, _ out: inout XDRWriter) throws {
-        let id = try readHandle(&a)
+        guard let id = try readHandle(&a) else { return badHandleNoAttr(&out) }
         out.u32(0)
         postOpAttr(id, &out)
         out.u32(1) // linkmax
@@ -614,7 +682,11 @@ public final class NFSServer {
     }
 
     private func commit(_ a: inout XDRReader, _ out: inout XDRWriter) throws {
-        let id = try readHandle(&a)
+        guard let id = try readHandle(&a) else {
+            out.u32(NFSStat.badhandle.rawValue)
+            wccEmpty(&out)
+            return
+        }
         out.u32(0)
         wcc(id, &out)
         out.fixed(writeVerifier)
@@ -622,9 +694,12 @@ public final class NFSServer {
 }
 
 enum ShrugNFSRandom {
+    /// The handle secret is the only thing keeping other programs out, so without randomness
+    /// the server stops rather than run with a guessable one.
     static func bytes(_ n: Int) -> Data {
         var d = Data(count: n)
-        _ = d.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, n, $0.baseAddress!) }
+        let status = d.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, n, $0.baseAddress!) }
+        precondition(status == errSecSuccess, "No randomness available")
         return d
     }
 }

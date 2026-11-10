@@ -10,9 +10,10 @@ Usage: shrug <command>
   setup                    Set up this Mac (./setup runs this)
   unlock                   Unlock (Touch ID, or the Shrug password)
   lock                     Lock now
-  add <path> [<where>]     Make <path> come from Shrug. A file already there moves into Shrug;
-                           a missing one is created empty. <where> is the place in ~/Shrug
-                           (default synced/<path>); --local or --remote picks another folder
+  add <path> [<where>]     Make <path> (in your home folder) come from Shrug. A file already
+                           there moves into Shrug; a missing one is created empty. <where> is
+                           the place in ~/Shrug (default synced/<path>); --local or --remote
+                           picks another folder
   remove <path>            Stop that link. The file stays in ~/Shrug
   use [<profile>]          Follow a profile (a new name creates one). Without a name, list them
   status                   Lock state, profile, storage, links
@@ -80,12 +81,22 @@ func absolute(_ path: String) -> String {
 
 let paths = ShrugPaths.current()
 
-func send(_ cmd: String, _ a: [String: String] = [:]) -> IPCResponse {
+func rawSend(_ cmd: String, _ a: [String: String] = [:]) -> IPCResponse {
     do {
         return try IPCClient.send(IPCRequest(cmd, a), socket: paths.socket)
     } catch {
         die("\(error)")
     }
+}
+
+/// Sends a command. If Shrug is locked and only the Shrug password can unlock it (no
+/// fingerprint, or you chose the password), asks for it, unlocks and sends the command again.
+func send(_ cmd: String, _ a: [String: String] = [:]) -> IPCResponse {
+    let r = rawSend(cmd, a)
+    guard r.code == "password-needed", cmd != "unlock" else { return r }
+    let unlocked = rawSend("unlock", ["password": ask("Shrug password", secret: true)])
+    guard unlocked.ok else { die(unlocked.message) }
+    return rawSend(cmd, a)
 }
 
 func run(_ cmd: String, _ a: [String: String] = [:]) -> Never {
@@ -102,14 +113,31 @@ func defaultDeviceName() -> String {
     return host.hasSuffix(".local") ? String(host.dropLast(6)) : host
 }
 
-/// Runs a command that may first need you to choose, for each path, whose file to keep.
+/// Runs a command that may first need answers: which links from another Mac to place here,
+/// then, for each path, whose file to keep.
 func runChoosing(_ cmd: String, _ a: [String: String]) -> Never {
     var choices: [String: String] = [:]
     var forAll: String?
+    var approved: [String]?
     while true {
         var request = a
         if !choices.isEmpty, let json = try? JSONFile.encode(choices) { request["choices"] = String(decoding: json, as: UTF8.self) }
+        if let approved, let json = try? JSONFile.encode(approved) { request["approve"] = String(decoding: json, as: UTF8.self) }
         let r = send(cmd, request)
+        if r.code == "confirm-links", approved == nil {
+            print("The profile links these on this Mac, and they aren't here yet:")
+            for line in r.message.split(separator: "\n") { print("  \(line)") }
+            while approved == nil {
+                switch ask("Place them? (y/n)") {
+                case "y", "Y", "yes": approved = r.list ?? []
+                case "n", "N", "no":
+                    approved = []
+                    print("They'll wait until you run 'shrug use' again.")
+                default: print("Type y or n.")
+                }
+            }
+            continue
+        }
         guard r.code == "collisions", let paths = r.list, !paths.isEmpty else {
             if r.ok {
                 if !r.message.isEmpty { print(r.message) }
@@ -123,7 +151,7 @@ func runChoosing(_ cmd: String, _ a: [String: String]) -> Never {
                 continue
             }
             print("""
-            \(p) exists on this Mac and in Shrug.
+            \(p): this Mac has its own file or link there, and Shrug has one too.
               [m] keep this Mac's version (it replaces Shrug's)
               [s] keep Shrug's version (this Mac's is deleted)
               [M] this Mac's for this and all following
@@ -238,7 +266,7 @@ case "setup":
     guard probe.ok else { die(probe.message) }
     if probe.code == "empty" {
         print("There's no vault there yet, so this is your first Mac. Choose a Shrug password")
-        print("(12+ characters) and keep it in your password manager.")
+        print("and keep it in your password manager.")
         let p1 = ask("New Shrug password", secret: true)
         if interactive {
             guard p1 == ask("Repeat it", secret: true) else { die("Passwords do not match") }

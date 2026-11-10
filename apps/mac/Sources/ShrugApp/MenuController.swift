@@ -7,23 +7,50 @@ import ShrugDaemon
 final class MenuController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let engine: Engine
     var item: NSStatusItem!
+    /// The password dialog is showing (main thread only): never more than one.
+    var askingPassword = false
 
     init(engine: Engine) {
         self.engine = engine
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.mainMenu = MenuController.editingMenu()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let menu = NSMenu()
         menu.delegate = self
         item.menu = menu
         engine.onChange = { [weak self] in self?.refreshIcon() }
+        // A program needs ~/Shrug and Touch ID can't unlock: ask for the Shrug password.
+        engine.askPassword = { [weak self] why, done in
+            DispatchQueue.main.async {
+                guard let self else { return done() }
+                self.askPassword(why: why, done: done)
+            }
+        }
         refreshIcon()
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.refreshIcon() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         engine.stop()
+    }
+
+    /// Shrug has no menu bar of its own, so nothing would turn ⌘V into Paste in its dialogs, and
+    /// a password from a password manager couldn't be pasted. This menu is never shown; it only
+    /// supplies the usual editing keys.
+    static func editingMenu() -> NSMenu {
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+        editItem.submenu = edit
+        let main = NSMenu()
+        main.addItem(NSMenuItem(title: "Shrug", action: nil, keyEquivalent: "")) // the app menu's place
+        main.addItem(editItem)
+        return main
     }
 
     // MARK: - Icon
@@ -103,13 +130,15 @@ final class MenuController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Actions
 
-    func background(_ work: @escaping () throws -> Void) {
+    /// Runs `work` off the main thread, shows its error if it fails, then calls `then`.
+    func background(_ work: @escaping () throws -> Void, then: (() -> Void)? = nil) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 try work()
             } catch {
                 DispatchQueue.main.async { self.alert("\(error)") }
             }
+            then?()
             DispatchQueue.main.async { self.refreshIcon() }
         }
     }
@@ -122,7 +151,7 @@ final class MenuController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             background {
                 do {
                     try self.engine.unlock(password: nil)
-                } catch let e as ShrugError where e.description == "password-needed" {
+                } catch is PasswordNeeded {
                     DispatchQueue.main.async { self.askPassword() }
                 }
             }
@@ -131,19 +160,26 @@ final class MenuController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func askPassword() {
+    /// The Shrug password dialog. `why` says what a program was doing when it asked; `done` runs
+    /// once the dialog is closed (after unlocking, if a password was given).
+    func askPassword(why: String? = nil, done: (() -> Void)? = nil) {
+        guard !askingPassword else { done?(); return }
+        askingPassword = true
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Unlock Shrug"
-        alert.informativeText = "Enter your Shrug password."
+        alert.informativeText = why.map { "Shrug is locked and \($0).\n\nEnter your Shrug password to unlock." }
+            ?? "Enter your Shrug password."
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
         alert.accessoryView = field
         alert.addButton(withTitle: "Unlock")
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = field
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let answered = alert.runModal() == .alertFirstButtonReturn
+        askingPassword = false
+        guard answered else { done?(); return }
         let password = field.stringValue
-        background { try self.engine.unlock(password: password) }
+        background({ try self.engine.unlock(password: password) }, then: done)
     }
 
     @objc func lockNow() {

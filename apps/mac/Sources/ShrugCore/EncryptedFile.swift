@@ -7,10 +7,11 @@ import Foundation
 ///     header:  "SHRUGEN1" | fileID (16 random bytes) | chunkSize (u32 BE)
 ///     chunks:  nonce (12) | ciphertext (<= chunkSize) | tag (16)
 ///
-/// Every file gets its own key: HKDF(master, salt: fileID). Each chunk is sealed
-/// with a fresh random nonce and authenticated together with its index, so a
-/// program can read or write any part of a large file without touching the rest,
-/// and a download can fetch just the chunks it needs.
+/// Every file gets its own key: HKDF(master, salt: fileID). Each chunk is sealed with a fresh
+/// random nonce and authenticated together with its index, so a program can read or write any
+/// part of a large file without touching the rest, and a download can fetch just the chunks it
+/// needs. Every upload is a fresh copy under a new file id, so chunks from different versions
+/// of a file never fit together. Empty content has no header at all.
 public enum EncFormat {
     public static let magic = Data("SHRUGEN1".utf8)
     public static let chunkSize = 65536
@@ -26,6 +27,14 @@ public enum EncFormat {
         let full = body / rs
         let rem = body % rs
         return full * Int64(chunkSize) + (rem > Int64(overhead) ? rem - Int64(overhead) : 0)
+    }
+
+    /// The exact encrypted size of complete content of `plainSize` bytes.
+    public static func encryptedSize(plainSize: Int64) -> Int64 {
+        guard plainSize > 0 else { return 0 }
+        let cs = Int64(chunkSize)
+        let rem = plainSize % cs
+        return Int64(headerSize) + plainSize / cs * Int64(recordSize) + (rem > 0 ? rem + Int64(overhead) : 0)
     }
 
     public static func fileKey(master: SymmetricKey, fileID: Data) -> SymmetricKey {
@@ -71,8 +80,7 @@ public final class EncryptedFile {
         self.url = url
         self.master = master
         self.base = base
-        var fd = writable ? Darwin.open(url.path, O_RDWR) : -1
-        if fd < 0 { fd = Darwin.open(url.path, O_RDONLY) }
+        let fd = Darwin.open(url.path, writable ? O_RDWR : O_RDONLY)
         guard fd >= 0 else { throw ShrugError("Cannot open \(url.lastPathComponent): \(String(cString: strerror(errno)))") }
         self.fd = fd
         let size = encryptedSize
@@ -91,7 +99,7 @@ public final class EncryptedFile {
 
     deinit { Darwin.close(fd) }
 
-    var encryptedSize: Int64 {
+    private var encryptedSize: Int64 {
         var st = stat()
         fstat(fd, &st)
         return max(0, Int64(st.st_size) - base)
@@ -101,6 +109,26 @@ public final class EncryptedFile {
 
     /// The random id that binds this content to its key (nil while empty).
     public var contentFileID: Data? { fileID }
+
+    /// Whether this is exactly the content a header describes: the same file id, and complete.
+    public func matches(fileID expected: String?, size expectedSize: Int64) -> Bool {
+        fileID?.hex == expected && encryptedSize == EncFormat.encryptedSize(plainSize: expectedSize)
+    }
+
+    /// Decrypts every chunk, so damage shows up now rather than when a program reads it.
+    public func verify() throws {
+        for index in 0..<chunkCount { _ = try readChunk(index) }
+    }
+
+    /// Copies the content into a new file at `url`, after `prefix`, under a fresh file id.
+    public func reencrypt(to url: URL, prefix: Data) throws -> EncryptedFile {
+        guard FileManager.default.createFile(atPath: url.path, contents: prefix, attributes: [.posixPermissions: 0o600]) else {
+            throw ShrugError("Cannot create \(url.lastPathComponent)")
+        }
+        let copy = try EncryptedFile(url: url, master: master, writable: true, base: Int64(prefix.count))
+        for index in 0..<chunkCount { try copy.writeChunk(index, try readChunk(index)) }
+        return copy
+    }
 
     private var chunkCount: Int {
         let body = encryptedSize - Int64(EncFormat.headerSize)
@@ -163,52 +191,51 @@ public final class EncryptedFile {
         return out
     }
 
+    /// Writes `data` at `offset`, filling any gap after the current end with zeros.
     public func write(offset: Int64, data: Data) throws {
-        var offset = offset
-        var data = Data(data)
-        let size = self.size
-        if offset > size {
-            data = Data(count: Int(offset - size)) + data
-            offset = size
-        }
         guard !data.isEmpty else { return }
-        let cs = Int64(EncFormat.chunkSize)
-        let end = offset + Int64(data.count)
-        let existingChunks = chunkCount
-        for index in Int(offset / cs)...Int((end - 1) / cs) {
-            let start = Int64(index) * cs
-            let existing = index < existingChunks ? try readChunk(index) : Data()
-            let newLength = max(existing.count, Int(min(cs, end - start)))
-            var buffer = existing
-            if buffer.count < newLength { buffer.append(Data(count: newLength - buffer.count)) }
-            let from = max(offset, start)
-            let to = min(end, start + cs)
-            buffer.replaceSubrange(
-                Int(from - start)..<Int(to - start),
-                with: data.subdata(in: Int(from - offset)..<Int(to - offset)))
-            if buffer == existing { continue } // unchanged content: keep the file byte-identical
-            try writeChunk(index, buffer)
-        }
+        try fill(from: min(offset, size), to: offset + Int64(data.count), with: data, at: offset)
     }
 
     public func truncate(to newSize: Int64) throws {
         let size = self.size
-        if newSize == size { return }
-        if newSize > size {
-            try write(offset: size, data: Data(count: Int(newSize - size)))
+        if newSize >= size { return try fill(from: size, to: newSize, with: Data(), at: newSize) }
+        if newSize == 0 {
+            guard ftruncate(fd, off_t(base)) == 0 else { throw ShrugError("Truncate failed") }
+            fileID = nil
+            key = nil
             return
         }
         let cs = Int64(EncFormat.chunkSize)
         let keep = Int(newSize / cs)
         let rem = Int(newSize % cs)
-        if rem > 0 {
-            let chunk = try readChunk(keep)
-            guard ftruncate(fd, recordOffset(keep)) == 0 else { throw ShrugError("Truncate failed") }
-            try writeChunk(keep, chunk.prefix(rem))
-        } else {
-            guard ftruncate(fd, newSize == 0 && fileID == nil ? off_t(base) : recordOffset(keep)) == 0 else {
-                throw ShrugError("Truncate failed")
+        let last = rem > 0 ? try readChunk(keep) : Data()
+        guard ftruncate(fd, recordOffset(keep)) == 0 else { throw ShrugError("Truncate failed") }
+        if rem > 0 { try writeChunk(keep, last.prefix(rem)) }
+    }
+
+    /// Rewrites the chunks covering `start..<end`: existing bytes stay, `data` (which belongs at
+    /// `dataOffset`) goes in where it overlaps, and the rest is zeros. One chunk at a time, so a
+    /// large gap never sits in memory.
+    private func fill(from start: Int64, to end: Int64, with data: Data, at dataOffset: Int64) throws {
+        guard start < end else { return }
+        let cs = Int64(EncFormat.chunkSize)
+        let existingChunks = chunkCount
+        let dataEnd = dataOffset + Int64(data.count)
+        for index in Int(start / cs)...Int((end - 1) / cs) {
+            let chunkStart = Int64(index) * cs
+            let existing = index < existingChunks ? try readChunk(index) : Data()
+            var buffer = existing
+            let length = Int(min(cs, end - chunkStart))
+            if buffer.count < length { buffer.append(Data(count: length - buffer.count)) }
+            let from = max(dataOffset, chunkStart)
+            let to = min(dataEnd, chunkStart + cs)
+            if from < to {
+                let slice = data.startIndex + Int(from - dataOffset)
+                buffer.replaceSubrange(Int(from - chunkStart)..<Int(to - chunkStart),
+                                       with: data[slice..<(slice + Int(to - from))])
             }
+            if buffer != existing { try writeChunk(index, buffer) } // unchanged content stays byte-identical
         }
     }
 }

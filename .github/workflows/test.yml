@@ -1,0 +1,50 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+# The jobs only read the code.
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    # scripts/e2e-test.sh and scripts/upgrade-test.sh mount ~/Shrug, which needs network volume
+    # access granted on a real Mac: run those locally.
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: apps/mac
+    steps:
+      # Pinned to a commit, not a movable tag.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build
+        run: swift build --build-tests
+      # The installed app is a release build, where test-only code (DEBUG) is left out.
+      - name: Build for release
+        run: swift build -c release
+      - name: Test
+        run: swift test --enable-code-coverage
+      - name: Coverage (at least 80% of lines)
+        run: |
+          bin=$(swift build --show-bin-path)
+          objects=()
+          for bundle in "$bin"/*.xctest; do objects+=(-object "$bundle/Contents/MacOS/$(basename "$bundle" .xctest)"); done
+          xcrun llvm-cov report -instr-profile "$bin/codecov/default.profdata" "${objects[@]}" \
+            -ignore-filename-regex '(\.build|Tests)/' \
+            -show-region-summary=false -show-branch-summary=false -show-instantiation-summary=false | tee coverage.txt
+          total=$(awk '/^TOTAL/ { sub("%", "", $NF); print $NF }' coverage.txt)
+          echo "Line coverage: $total%"
+          awk -v t="$total" 'BEGIN { exit !(t >= 80) }' || { echo "::error::Line coverage $total% is under 80%"; exit 1; }
+
+  thread-sanitizer:
+    # The engine, the NFS server and the socket all run on many threads.
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: apps/mac
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Test under Thread Sanitizer
+        run: swift test --sanitize=thread

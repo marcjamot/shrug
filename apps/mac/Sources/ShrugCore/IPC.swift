@@ -86,6 +86,22 @@ public struct StatusInfo: Codable, Sendable {
     }
 }
 
+public enum Descriptor {
+    /// Writes everything, retrying short writes. False if the descriptor stopped taking data.
+    @discardableResult
+    public static func writeAll(_ fd: Int32, _ data: Data) -> Bool {
+        data.withUnsafeBytes { raw in
+            var offset = 0
+            while offset < raw.count {
+                let n = write(fd, raw.baseAddress! + offset, raw.count - offset)
+                if n <= 0 { return false }
+                offset += n
+            }
+            return true
+        }
+    }
+}
+
 public enum UnixSocket {
     static func address(_ path: String) throws -> sockaddr_un {
         var addr = sockaddr_un()
@@ -100,9 +116,16 @@ public enum UnixSocket {
         return addr
     }
 
+    /// A peer that hangs up early makes writes fail instead of killing the process with SIGPIPE.
+    public static func ignoreHangups(_ fd: Int32) {
+        var one: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+    }
+
     public static func connect(_ path: String) throws -> Int32 {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw ShrugError("socket() failed") }
+        ignoreHangups(fd)
         var addr = try address(path)
         let r = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
@@ -136,38 +159,41 @@ public enum UnixSocket {
         return fd
     }
 
-    public static func readLine(_ fd: Int32) -> Data? {
-        var buffer = Data()
-        var byte: UInt8 = 0
-        while true {
-            let n = read(fd, &byte, 1)
-            if n <= 0 { return buffer.isEmpty ? nil : buffer }
-            if byte == 0x0A { return buffer }
-            buffer.append(byte)
+    /// One line (without its newline), at most `limit` bytes. Nil if the peer closed first or
+    /// sent more than that. Anything after the newline is ignored: one request per connection.
+    public static func readLine(_ fd: Int32, limit: Int) -> Data? {
+        var line = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while line.count <= limit {
+            let n = read(fd, &buffer, buffer.count)
+            if n <= 0 { return nil }
+            if let end = buffer[0..<n].firstIndex(of: 0x0A) {
+                line.append(contentsOf: buffer[0..<end])
+                return line.count <= limit ? line : nil
+            }
+            line.append(contentsOf: buffer[0..<n])
         }
+        return nil
     }
 
-    public static func writeAll(_ fd: Int32, _ data: Data) {
-        data.withUnsafeBytes { raw in
-            var offset = 0
-            while offset < raw.count {
-                let n = write(fd, raw.baseAddress! + offset, raw.count - offset)
-                if n <= 0 { return }
-                offset += n
-            }
-        }
+    /// One JSON value on one line.
+    public static func send<T: Encodable>(_ value: T, to fd: Int32) throws {
+        var data = try JSONFile.encode(value)
+        data.removeAll { $0 == 0x0A }
+        data.append(0x0A)
+        guard Descriptor.writeAll(fd, data) else { throw ShrugError("The connection to Shrug broke") }
     }
 }
 
 public enum IPCClient {
+    /// Biggest answer the command line accepts (a status lists every link).
+    static let answerLimit = 4 << 20
+
     public static func send(_ request: IPCRequest, socket path: String) throws -> IPCResponse {
         let fd = try UnixSocket.connect(path)
         defer { close(fd) }
-        var data = try JSONFile.encode(request)
-        data.removeAll { $0 == 0x0A }
-        data.append(0x0A)
-        UnixSocket.writeAll(fd, data)
-        guard let line = UnixSocket.readLine(fd) else { throw ShrugError("No answer from Shrug") }
+        try UnixSocket.send(request, to: fd)
+        guard let line = UnixSocket.readLine(fd, limit: answerLimit) else { throw ShrugError("No answer from Shrug") }
         return try JSONFile.decode(IPCResponse.self, from: line)
     }
 }

@@ -33,7 +33,10 @@ public struct ShrugPaths: Sendable {
         return ShrugPaths(state: state, mount: mount, home: home, socket: socket)
     }
 
-    /// The vault keyring copy and this Mac's local key, both password-wrapped.
+    /// The format of everything in here (see Migrations).
+    public var versionFile: URL { state.appendingPathComponent("version") }
+    /// The vault keyring copy and this Mac's local key, both password-wrapped, and sealed by
+    /// the security chip when there is one.
     public var keyringFile: URL { state.appendingPathComponent("keyring.json") }
     public var touchIDFile: URL { state.appendingPathComponent("touchid.json") }
     /// Settings, credentials, profile and links: encrypted with the local key.
