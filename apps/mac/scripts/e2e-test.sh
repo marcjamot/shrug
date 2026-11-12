@@ -1,7 +1,7 @@
 #!/bin/bash
 # End-to-end test in a throwaway folder: two "Macs" on this machine, each with its own
-# Shrug app, ~/Shrug mount and home folder, sharing a plain folder as the bucket. It uses
-# only shrug and ordinary file commands. Touches nothing outside the test folder.
+# Shrug app, ~/Shrug mount, ~/ShrugDisk and home folder, sharing a plain folder as the bucket.
+# It uses only shrug and ordinary file commands. Touches nothing outside the test folder.
 #
 #   apps/mac/scripts/e2e-test.sh            # KEEP=1 keeps the folder afterwards
 #
@@ -35,6 +35,8 @@ mac1() { env "${MAC1[@]}" "$@"; }
 mac2() { env "${MAC2[@]}" "$@"; }
 ctl1() { mac1 "$BIN/shrug" "$@"; }
 ctl2() { mac2 "$BIN/shrug" "$@"; }
+DISK1="$T/home1/ShrugDisk"
+DISK2="$T/home2/ShrugDisk"
 status1_has() { ctl1 status | grep -q "$1"; }
 status2_has() { ctl2 status | grep -q "$1"; }
 answers() { local input=$1; shift; printf '%b' "$input" | "$@"; }
@@ -48,6 +50,10 @@ cleanup() {
     if mounted "$m"; then /usr/sbin/diskutil unmount force "$m" >/dev/null 2>&1; fi
     chmod 700 "$m" 2>/dev/null
   done
+  for d in "$DISK1" "$DISK2"; do
+    if mounted "$d"; then /usr/bin/hdiutil detach "$d" -force >/dev/null 2>&1; fi
+    chmod 700 "$d" 2>/dev/null
+  done
   if [ "${KEEP:-0}" = 1 ]; then echo "Kept $T"; else rm -rf "$T"; fi
 }
 trap cleanup EXIT
@@ -57,6 +63,8 @@ echo "Building…"
 
 mkdir -p "$T/home1/.ssh" "$T/home2/.ssh" "$T/bucket"
 export SHRUG_NO_TOUCHID=1 SHRUG_TEST_KDF_ITERATIONS=1000 SHRUG_SYNC_SECONDS=1 SHRUG_DEBOUNCE_SECONDS=1
+# Space is given back for 100 MB (not 2 GB), so the test doesn't need to write that much.
+export SHRUG_TEST_RECLAIM_MB=100
 
 echo "1. First Mac"
 env "${MAC1[@]}" "$BIN/ShrugApp" --headless >"$T/daemon1.log" 2>&1 &
@@ -65,6 +73,11 @@ wait_for "app answers" 10 ctl1 status
 wait_for "~/Shrug mounted" 10 mounted "$T/mnt1"
 check "setup creates the vault" answers "$PW\n" ctl1 setup --storage folder --path "$T/bucket" --device mac1 --profile work
 check "status says unlocked" status1_has "Shrug:     unlocked"
+check "~/ShrugDisk is attached" mounted "$DISK1"
+# Used: what its files take, under 100 MB here. (What's free is this Mac's own free space.)
+disk_nearly_empty() { ctl1 status | awk '/^Disk:/ && $5 == "used," && ($4 == "bytes" || $4 == "KB" || ($4 == "MB" && $3 < 100)) { ok = 1 } END { exit !ok }'; }
+check "...and in status" status1_has "Disk:      ~/ShrugDisk: .* used, .* free on this Mac"
+check "...as nearly empty" disk_nearly_empty
 check "~/Shrug shows the three folders" sh -c "[ \"\$(ls '$T/mnt1' | tr '\n' ' ')\" = 'local remote synced ' ]"
 check "nothing can go next to them" refused touch "$T/mnt1/stray.txt"
 
@@ -188,10 +201,34 @@ check "...intact" cmp "$T/huge.bin" "$T/mnt2/synced/huge.bin"
 check "lock and unlock" sh -c "env ${MAC1[*]} '$BIN/shrug' lock && printf '%s\n' '$PW' | env ${MAC1[*]} '$BIN/shrug' unlock --password"
 check "the extended attribute lasted until the lock" sh -c "grep -q 'this Mac only' '$T/mnt1/local/mine.txt' && ! xattr -p user.note '$T/mnt1/local/mine.txt'"
 
-echo "8. A crash"
+echo "8. ShrugDisk"
+check "500 files extract onto it in a second or two" within 2 tar -C "$DISK1" -xf "$T/tree.tar"
+check "...all of them" sh -c "[ \"\$(find '$DISK1/tree' -type f | wc -l | tr -d ' ')\" = 500 ]"
+check "a file on it" sh -c "echo 'DISK SECRET e2e' > '$DISK1/note.txt'"
+check "the other Mac has its own disk, without it" sh -c "mount | grep -q ' on $DISK2 (' && [ ! -e '$DISK2/note.txt' ]"
+check "nothing of it is readable in ~/.shrug" refused grep -rqa -e 'DISK SECRET' -e 'note.txt' "$T/state1"
+exec 3<"$DISK1/note.txt"
+check "lock" ctl1 lock
+check "the disk is ejected, even with a file open on it" refused mounted "$DISK1"
+check "...which can't be read any more" refused sh -c 'cat <&3'
+exec 3<&-
+check "~/ShrugDisk is an empty folder that takes nothing" sh -c "[ -z \"\$(ls -A '$DISK1')\" ] && ! touch '$DISK1/stray.txt'"
+check "status doesn't mention it" refused status1_has "Disk:"
+check "unlock brings it back" answers "$PW\n" ctl1 unlock --password
+check "...with its files" grep -q 'DISK SECRET e2e' "$DISK1/note.txt"
+# macOS never gives a deleted file's space in a disk image back by itself.
+check "800 MB written to it and deleted" sh -c "head -c 800000000 /dev/urandom > '$DISK1/big.bin' && rm '$DISK1/big.bin'"
+wait_for "the disk counts the space as free again" 30 disk_nearly_empty
+IMAGE_MB=$(du -sm "$T/state1/disk.sparsebundle" | cut -f1)
+check "lock and unlock" sh -c "env ${MAC1[*]} '$BIN/shrug' lock && printf '%s\n' '$PW' | env ${MAC1[*]} '$BIN/shrug' unlock --password"
+check "the space went back to this Mac (${IMAGE_MB} MB before)" sh -c "[ \$(du -sm '$T/state1/disk.sparsebundle' | cut -f1) -lt $((IMAGE_MB - 200)) ]"
+check "...and every file is still there" sh -c "diff -r '$T/tree' '$DISK1/tree' && grep -q 'DISK SECRET e2e' '$DISK1/note.txt'"
+
+echo "9. A crash"
 check "a new file, a new folder and a rename" sh -c "echo 'made just before' > '$T/mnt1/local/last.txt' && mkdir '$T/mnt1/synced/lastdir' && mv '$T/mnt1/local/mine.txt' '$T/mnt1/local/moved.txt'"
 kill -9 "$D1"
 wait "$D1" 2>/dev/null
+wait_for "the disk is ejected when Shrug is killed" 5 refused mounted "$DISK1"
 env "${MAC1[@]}" "$BIN/ShrugApp" --headless >>"$T/daemon1.log" 2>&1 &
 D1=$!
 wait_for "the app starts again" 60 ctl1 status
@@ -199,26 +236,29 @@ wait_for "...and unlocks" 60 answers "$PW\n" ctl1 unlock --password
 wait_for "the new file is there" 60 grep -q 'made just before' "$T/mnt1/local/last.txt"
 check "...and the folder, and the rename" sh -c "[ -d '$T/mnt1/synced/lastdir' ] && grep -q 'this Mac only' '$T/mnt1/local/moved.txt' && [ ! -e '$T/mnt1/local/mine.txt' ]"
 check "...and the large file" cmp "$T/huge.bin" "$T/mnt1/synced/huge.bin"
+check "...and what was on the disk" grep -q 'DISK SECRET e2e' "$DISK1/note.txt"
 wait_for "it syncs again" 60 status1_has "up to date"
 
 if [ "${LOCK_SCREEN:-0}" = 1 ]; then
-  echo "9. Screen lock (unlock your Mac when it's done)"
+  echo "10. Screen lock (unlock your Mac when it's done)"
   both_unlocked() { status1_has "Shrug:     unlocked" && status2_has "Shrug:     unlocked"; }
   check "both are unlocked" both_unlocked
   pmset displaysleepnow
   wait_for "mac1 locks with the screen" 5 status1_has "Shrug:     locked"
   wait_for "mac2 locks with the screen" 5 status2_has "Shrug:     locked"
 else
-  echo "9. Screen lock: skipped (LOCK_SCREEN=1 runs it, and locks your screen)"
+  echo "10. Screen lock: skipped (LOCK_SCREEN=1 runs it, and locks your screen)"
 fi
 
-echo "10. Quit"
+echo "11. Quit"
 kill "$D1" "$D2"
 wait "$D1" "$D2" 2>/dev/null
 D1=""; D2=""
 both_unmounted() { ! mounted "$T/mnt1" && ! mounted "$T/mnt2"; }
 wait_for "both folders unmounted" 10 both_unmounted
 check "~/Shrug is empty and can't be written to" sh -c "[ -z \"\$(ls -A '$T/mnt1')\" ] && ! touch '$T/mnt1/x' 2>/dev/null"
+check "both disks are ejected" sh -c "! mount | grep -q -e ' on $DISK1 (' -e ' on $DISK2 ('"
+check "~/ShrugDisk is empty and can't be written to" sh -c "[ -z \"\$(ls -A '$DISK1')\" ] && ! touch '$DISK1/x' 2>/dev/null"
 
 echo
 if [ $FAILS = 0 ]; then echo "All checks passed."; else echo "$FAILS check(s) failed. Logs: $T/daemon1.log $T/daemon2.log"; KEEP=1; fi

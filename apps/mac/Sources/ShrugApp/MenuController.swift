@@ -86,6 +86,7 @@ final class MenuController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let s = engine.status()
         menu.addItem(disabled(headline(s)))
         if !s.mounted { menu.addItem(disabled("The Shrug folder isn't mounted")) }
+        if let problem = s.disk?.problem { menu.addItem(disabled("ShrugDisk: \(problem)")) }
         if s.unlocked {
             menu.addItem(disabled(storageLine(s)))
             if let p = s.profile { menu.addItem(disabled("Profile: \(p)")) }
@@ -112,6 +113,7 @@ final class MenuController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if s.touchID { menu.addItem(action("Unlock with Password…", #selector(unlockPassword))) }
             }
             menu.addItem(action("Open Shrug Folder", #selector(openFolder)))
+            if s.disk?.open == true { menu.addItem(action("Open ShrugDisk", #selector(openDisk))) }
         } else {
             menu.addItem(disabled("Run ./setup in the repo folder"))
         }
@@ -237,6 +239,10 @@ final class MenuController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openFolder() {
         NSWorkspace.shared.open(engine.paths.mount)
+    }
+
+    @objc func openDisk() {
+        NSWorkspace.shared.open(engine.paths.disk)
     }
 
     @objc func toggleLogin() {

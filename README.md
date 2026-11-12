@@ -1,6 +1,8 @@
 # Shrug
 
-Shrug keeps your SSH keys, kubeconfigs, API tokens and other private files encrypted in a cloud bucket you own. While you use your computer, they work like normal files. When the computer locks, Shrug locks too and the files can't be read.
+Shrug keeps your private files (SSH keys, kubeconfigs, API tokens, customer data) encrypted, on your Mac and in a cloud bucket you own. While you work they are normal files. When the Mac locks, Shrug locks with it and nothing can be read.
+
+It protects your files if the Mac is lost or stolen. It is not built to stop a skilled attacker who is already on it.
 
 > [!NOTE]
 > The code in this repository is written by an AI agent and reviewed by a computer engineer.
@@ -8,57 +10,35 @@ Shrug keeps your SSH keys, kubeconfigs, API tokens and other private files encry
 > [!NOTE]
 > The current version only supports macOS.
 
-## How it works
+## What it offers
 
-Shrug stores its data in `~/.shrug`. You open and edit your files in `~/Shrug`, which has three folders:
+Shrug gives you two places for private files. Both lock when the screen locks, the Mac sleeps or you switch user, and a fingerprint or your Shrug password unlocks them.
 
-- `synced/` is for files you need on every computer, even offline.
-- `remote/` is for files that shouldn't be stored on any computer. They stay in the bucket and are only kept on the computer while you use them.
-- `local/` is for files that should never leave this computer.
+| | `~/Shrug` | `~/ShrugDisk` |
+|---|---|---|
+| For | Secrets your tools read: keys, tokens, configs | Data you work on: code, customer files, large files |
+| Kept | Your choice per folder: every Mac, the bucket only, or this Mac only | On this Mac only |
+| Reached | At the usual path: `~/.ssh/id_ed25519` is a link into `~/Shrug` | Inside `~/ShrugDisk` |
+| Speed | Fine for single files, slow for thousands | As fast as the Mac's own disk |
+| While locked | Opening a file asks for your fingerprint | Empty until Shrug unlocks. Shrug asks once when you return to the Mac |
 
-Shrug puts links at the paths your tools already use. Your SSH key can be in `~/Shrug/synced/ssh/id_ed25519`, and `~/.ssh/id_ed25519` is a link to it.
+`~/Shrug` has three folders, which decide where a file is kept:
 
-All files are encrypted on the computer and in the bucket. Shrug locks when the screen locks, the computer sleeps or you switch to another user. `~/Shrug` then looks empty, and opening a file prompts for your fingerprint or Shrug password.
+- `synced/` is on every Mac, even offline.
+- `remote/` stays in the bucket and is fetched when you open it.
+- `local/` never leaves this Mac.
 
-## Profiles
+`local/` and `~/ShrugDisk` both stay on this Mac, and Shrug backs up neither. They differ the way the two columns do. `local/` is for a secret that a tool opens through a link, and it asks for your fingerprint when opened. `~/ShrugDisk` is for everything you work on: it is fast, has no links, and is empty while Shrug is locked.
 
-A profile lets each computer have its own set of links. Your work laptop can follow a `work` profile that links the work kubeconfig, while your home computer follows a `home` profile without it. Several computers can follow the same profile. A profile only decides the links, not which files are in `~/Shrug`.
+Files are encrypted before upload, names included, so the storage provider can't read them.
 
-## Security
+## How to use it
 
-Shrug keeps your files safe if you lose your computer. It won't stop a skilled attacker.
+1. Create a Google Cloud Storage bucket and a service account with the Storage Object User role on it.
+2. Run `./setup` on each Mac. To update, pull the latest version and run it again.
+3. Add files. `shrug add ~/.ssh/id_ed25519` moves the key to `~/Shrug/synced/ssh/id_ed25519` and leaves a link at the old path. You can also put files straight into `~/Shrug` or `~/ShrugDisk`.
 
-- Files are encrypted on your computer (AES-256-GCM) before they're uploaded, names included. The storage provider only sees random names, rough sizes and when files change.
-- Your Shrug password unlocks the vault key, which is stored in the bucket. Each computer also keeps a copy sealed by its security chip, so your fingerprint can unlock it.
-
-On a trusted network, your files are only as safe as the Mac's lock screen. Shrug knows a network by its router's hardware address, which someone who has been on that network can copy.
-
-Shrug doesn't protect copies that apps make on their own, such as autosaves, previews and exports. When two computers edit the same file, the newest edit wins, so an older edit made offline is lost.
-
-## Setup
-
-Create a Google Cloud Storage bucket and a service account with the Storage Object User role on it. Then run `./setup` on each computer. To update, pull the latest version and run `./setup` again.
-
-## Usage
-
-| Command | What it does |
-|---|---|
-| `shrug add ~/.kube/config` | Moves the file to `~/Shrug/synced/kube/config` and leaves a link in its place (creates the file if missing) |
-| `shrug add ~/.kube/config synced/work/kubeconfig` | Same, but you pick where it goes |
-| `shrug remove ~/.kube/config` | Removes the link but keeps the file in Shrug |
-| `shrug use`, `shrug use work` | Lists profiles, or follows one (a new name creates it) |
-| `shrug lock`, `shrug unlock` | Locks or unlocks Shrug |
-| `shrug trust`, `shrug trust office` | Trusts the network this Mac is on, with an optional name (asks for your fingerprint or Shrug password) |
-| `shrug untrust`, `shrug untrust office` | Stops trusting this network, or the one you name |
-| `shrug status` | Shows the lock state, profile, storage, trusted networks and links |
-
-By default, `shrug add` uses the file's path relative to your home folder, minus the leading dot so it isn't hidden. Add `--remote` or `--local` to put the file in that folder instead of `synced/`.
-
-If an app replaces a link with a real file when saving, Shrug moves the new file into `~/Shrug` and puts the link back. If a file or another link already exists where a link should go, Shrug asks which version to keep and deletes the other.
-
-Deleting or moving a file at its usual path, like `rm ~/.kube/config`, removes only the link. The file stays at `~/Shrug/synced/kube/config`, and nothing in `~/.shrug` is deleted. Other Macs that follow the same profile lose the link too.
-
-Deleting or moving the file in `~/Shrug` changes the real file. Deleting `~/Shrug/synced/kube/config` deletes it on every Mac and removes the link at `~/.kube/config`. Renaming it, or moving it elsewhere in `synced/`, keeps the link working.
+`shrug status` shows what Shrug is doing, and `shrug help` lists every command.
 
 ## License
 

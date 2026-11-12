@@ -19,7 +19,7 @@ Usage: shrug <command>
   trust [<name>]           Trust the network this Mac is on: Shrug stays unlocked there when
                            the screen locks, until the Mac leaves it, sleeps or you switch user
   untrust [<name>]         Stop trusting a network (this one, unless you name another)
-  status                   Lock state, profile, storage, links
+  status                   Lock state, profile, storage, disk, links
 
 Answers can also be piped in, one per line, in the order they're asked.
 """
@@ -183,6 +183,18 @@ func ago(_ d: Date) -> String {
     return "\(s / 86400) days ago"
 }
 
+/// "1.2 GB", as Finder would put it.
+func size(_ bytes: Int64) -> String {
+    let units = ["bytes", "KB", "MB", "GB", "TB"]
+    var value = Double(bytes)
+    var unit = 0
+    while value >= 1000, unit < units.count - 1 {
+        value /= 1000
+        unit += 1
+    }
+    return unit == 0 ? "\(bytes) bytes" : String(format: value < 10 ? "%.1f %@" : "%.0f %@", value, units[unit])
+}
+
 func printStatus(_ s: StatusInfo) {
     guard s.setUp else {
         print("Not set up. Run ./setup in the repo folder.")
@@ -192,7 +204,19 @@ func printStatus(_ s: StatusInfo) {
     let held = s.held.map { " (screen locked: staying unlocked on \($0))" } ?? ""
     print("Shrug:     \(s.unlocked ? "unlocked" : "locked")\(held)\(s.touchID ? "  [Touch ID on]" : "")")
     print("Folder:    \(tilde)\(s.mounted ? "" : "  (NOT mounted)")")
+    func diskLine() {
+        guard let d = s.disk else { return }
+        let shown = d.path.hasPrefix(paths.home.path + "/") ? "~/" + d.path.dropFirst(paths.home.path.count + 1) : d.path
+        let state: String
+        if d.open {
+            state = "\(size(d.used ?? 0)) used" + (d.free.map { ", \(size($0)) free on this Mac" } ?? "")
+        } else {
+            state = d.problem ?? (d.opening ? "opening" : "closed")
+        }
+        print("Disk:      \(shown): \(state)")
+    }
     guard s.unlocked else {
+        diskLine()
         print("Unlock to see more.")
         return
     }
@@ -213,6 +237,7 @@ func printStatus(_ s: StatusInfo) {
         state = "up to date" + (s.lastSync.map { " (checked \(ago($0)))" } ?? "")
     }
     print("Storage:   \(s.storage ?? "-"): \(state)")
+    diskLine()
     if let trusted = s.trusted, !trusted.isEmpty {
         print("Trusted:   \(trusted.map { $0 == s.trustedHere ? "\($0) (this network)" : $0 }.joined(separator: ", "))")
     }

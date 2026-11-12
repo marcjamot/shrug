@@ -77,13 +77,17 @@ enum Router {
 
 /// Mounting the virtual folder with the system NFS client.
 enum Mounter {
-    static func isMounted(_ url: URL) -> Bool {
+    /// The kind of file system mounted right at `url` ("nfs", "apfs"), or nil if `url` is just
+    /// a folder on whatever holds it.
+    static func fileSystem(at url: URL) -> String? {
         var s = statfs()
-        guard statfs(url.path, &s) == 0 else { return false }
+        guard statfs(url.path, &s) == 0 else { return nil }
         let type = withUnsafeBytes(of: &s.f_fstypename) { String(cString: $0.bindMemory(to: CChar.self).baseAddress!) }
         let on = withUnsafeBytes(of: &s.f_mntonname) { String(cString: $0.bindMemory(to: CChar.self).baseAddress!) }
-        return type == "nfs" && on == url.resolvingSymlinksInPath().path
+        return on == (ShrugPaths.realpath(url.path) ?? url.path) ? type : nil
     }
+
+    static func isMounted(_ url: URL) -> Bool { fileSystem(at: url) == "nfs" }
 
     static func mount(port: UInt16, at url: URL) throws {
         unmount(url) // clean up after a crash
@@ -129,14 +133,22 @@ enum Mounter {
         _ = try? run("/usr/sbin/diskutil", ["unmount", "force", url.path])
     }
 
-    static func run(_ tool: String, _ args: [String]) throws -> (code: Int32, output: String) {
+    /// Runs a system tool and waits for it. `input` is what it reads (a passphrase, so it
+    /// never shows among the arguments).
+    static func run(_ tool: String, _ args: [String], input: Data? = nil) throws -> (code: Int32, output: String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: tool)
         p.arguments = args
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
+        let stdin = input.map { _ in Pipe() }
+        if let stdin { p.standardInput = stdin }
         try p.run()
+        if let input, let stdin {
+            try? stdin.fileHandleForWriting.write(contentsOf: input)
+            try? stdin.fileHandleForWriting.close()
+        }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         return (p.terminationStatus, String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))

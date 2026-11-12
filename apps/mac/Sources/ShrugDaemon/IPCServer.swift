@@ -92,6 +92,7 @@ extension Engine {
                 return IPCResponse(ok: true, message: "", status: status())
             case "unlock":
                 try unlock(password: a["password"])
+                disk.settle() // so ~/ShrugDisk is there when the command returns
                 return ok("Unlocked")
             case "lock":
                 lockNow("locked from the command line")
@@ -103,6 +104,7 @@ extension Engine {
                 let (config, creds) = try Engine.storageArgs(a)
                 let names = try setup(config, creds, password: a["password"] ?? "", deviceName: a["device"] ?? "",
                                       create: a["create"] == "1")
+                disk.settle()
                 return IPCResponse(ok: true, message: "Set up and unlocked", list: names)
             case "use":
                 return outcome(try use(a["name"], choices: Engine.choices(a), approve: Engine.approvals(a)))
@@ -155,8 +157,9 @@ extension Engine {
 
     /// While locked, nothing that could name a file.
     public func status() -> StatusInfo {
-        let base = StatusInfo(setUp: paths.isSetUp, unlocked: isUnlocked, touchID: touchID.isEnrolled, mounted: mounted,
+        var base = StatusInfo(setUp: paths.isSetUp, unlocked: isUnlocked, touchID: touchID.isEnrolled, mounted: mounted,
                               mount: paths.mount.path)
+        base.disk = disk.status(unlocked: false)
         guard let st = stateCopy(), let store = store else { return base }
         var info = base
         info.device = st.deviceName
@@ -173,6 +176,7 @@ extension Engine {
         info.trusted = trusted.map(\.name)
         info.trustedHere = trustedNetwork(among: trusted)?.name
         info.held = heldOpenBy
+        info.disk = disk.status(unlocked: true)
         lock.lock()
         info.lastEvent = lastEventText
         lock.unlock()

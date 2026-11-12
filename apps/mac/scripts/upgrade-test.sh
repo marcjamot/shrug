@@ -1,7 +1,7 @@
 #!/bin/bash
 # Upgrade test in a throwaway folder: an older Shrug, built from git, sets up a vault with a
 # few files and a link, then quits; this version opens the same Mac and vault, upgrades them,
-# and must still show everything. Touches nothing outside the test folder.
+# and must still show everything (and what's new since). Touches nothing outside the test folder.
 #
 #   apps/mac/scripts/upgrade-test.sh [old-revision]     # default: the last commit (HEAD)
 #                                                       # KEEP=1 keeps the folder afterwards
@@ -20,6 +20,7 @@ check() { local what=$1; shift; if "$@" >/dev/null 2>&1; then pass "$what"; else
 wait_for() { local what=$1 secs=$2; shift 2; for _ in $(seq 1 "$secs"); do "$@" >/dev/null 2>&1 && { pass "$what"; return; }; sleep 1; done; fail "$what"; }
 mounted() { mount | grep -q " on $T/mnt ("; }
 unmounted() { ! mounted; }
+disk_attached() { mount | grep -q " on $T/home/ShrugDisk ("; }
 
 MAC=(SHRUG_STATE_DIR="$T/state" SHRUG_MOUNT_DIR="$T/mnt" SHRUG_HOME_DIR="$T/home" SHRUG_SOCKET="$T/s")
 ctl() { env "${MAC[@]}" "$BIN/shrug" "$@"; }
@@ -32,7 +33,8 @@ cleanup() {
   [ -n "$APP" ] && kill "$APP" 2>/dev/null
   wait 2>/dev/null
   if mounted; then /usr/sbin/diskutil unmount force "$T/mnt" >/dev/null 2>&1; fi
-  chmod 700 "$T/mnt" 2>/dev/null
+  if disk_attached; then /usr/bin/hdiutil detach "$T/home/ShrugDisk" -force >/dev/null 2>&1; fi
+  chmod 700 "$T/mnt" "$T/home/ShrugDisk" 2>/dev/null
   rm -f "${TMPDIR:-/tmp}"/*"$(basename "$T")"*.lock # SwiftPM's locks for the old version's build
   if [ "${KEEP:-0}" = 1 ]; then echo "Kept $T"; else rm -rf "$T"; fi
 }
@@ -73,7 +75,7 @@ wait_for "it mounts ~/Shrug" 10 mounted
 check "it unlocks with the password" sh -c "printf '%s\n' '$PW' | env ${MAC[*]} '$BIN/shrug' unlock --password"
 wait_for "it syncs" 20 status_has "up to date"
 NEW_FORMAT=$(cat "$T/state/version" 2>/dev/null)
-check "this Mac's files are upgraded (format $OLD_FORMAT -> ${NEW_FORMAT:-none})" test -n "$NEW_FORMAT" -a "$NEW_FORMAT" -gt "$OLD_FORMAT"
+check "this Mac's files are in this version's format ($OLD_FORMAT -> ${NEW_FORMAT:-none})" test -n "$NEW_FORMAT" -a "$NEW_FORMAT" -ge "$OLD_FORMAT"
 check "the vault is upgraded too" test "$(vault_format)" = "$NEW_FORMAT"
 check "the key reads through its link" grep -q 'OLD PRIVATE KEY' "$T/home/.ssh/id_upgrade"
 check "the link is still ok" sh -c "env ${MAC[*]} '$BIN/shrug' status | grep -q 'ok  ~/.ssh/id_upgrade'"
@@ -83,7 +85,13 @@ check "the local/ file is there" grep -q 'this Mac only' "$T/mnt/local/mine.txt"
 check "the offline change went up" sh -c "grep -q 'written offline' '$T/mnt/synced/offline.txt' && env ${MAC[*]} '$BIN/shrug' status | grep -q 'up to date'"
 check "and an edit still syncs" sh -c "echo more >> '$T/mnt/synced/offline.txt'"
 wait_for "...up to the bucket" 20 status_has "up to date"
+# Older versions had no ~/ShrugDisk: the first unlock makes one. (Skipped when the old version had it.)
+if [ ! -e "$T/old/Sources/ShrugDaemon/Disk.swift" ]; then
+  wait_for "it gets a ~/ShrugDisk" 15 disk_attached
+  check "...that takes files" sh -c "echo 'on the new disk' > '$T/home/ShrugDisk/new.txt' && grep -q 'on the new disk' '$T/home/ShrugDisk/new.txt'"
+fi
 quit
+wait_for "quitting ejects the disk" 10 sh -c "! mount | grep -q ' on $T/home/ShrugDisk ('"
 
 echo
 if [ $FAILS = 0 ]; then echo "All checks passed."; else echo "$FAILS check(s) failed. Log: $T/app.log"; KEEP=1; fi

@@ -28,6 +28,101 @@ final class TestClock: @unchecked Sendable {
     }
 }
 
+/// Stands in for the disk at ~/ShrugDisk: nothing is made or attached, and the test says what
+/// is on it. Shrug works on the disk from a queue of its own, so everything here is locked.
+final class FakeDisk: DiskImage, @unchecked Sendable {
+    private struct State {
+        var made = false
+        var attached = false
+        var key: String?
+        var asked: [String] = []
+        var files: [String] = []
+        var usedBytes: Int64 = 0
+        var imageBytes: Int64 = 0
+        var attachFails: Error?
+        var ejectFails: Error?
+        var holdAttach: DispatchSemaphore?
+    }
+
+    private let lock = NSLock()
+    private var state = State()
+
+    private func locked<T>(_ body: (inout State) throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body(&state)
+    }
+
+    /// Everything asked of the disk so far, in order: "create", "attach", "eject", "reclaim".
+    var asked: [String] { locked { $0.asked } }
+    /// What's on the disk, and the space it and its image take.
+    var files: [String] {
+        get { locked { $0.files } }
+        set { locked { $0.files = newValue } }
+    }
+    var usedBytes: Int64 {
+        get { locked { $0.usedBytes } }
+        set { locked { $0.usedBytes = newValue } }
+    }
+    var imageBytes: Int64 {
+        get { locked { $0.imageBytes } }
+        set { locked { $0.imageBytes = newValue } }
+    }
+    /// What every attach or eject from now on fails with.
+    var attachFails: Error? {
+        get { locked { $0.attachFails } }
+        set { locked { $0.attachFails = newValue } }
+    }
+    var ejectFails: Error? {
+        get { locked { $0.ejectFails } }
+        set { locked { $0.ejectFails = newValue } }
+    }
+    /// Keeps an attach under way until signalled.
+    var holdAttach: DispatchSemaphore? {
+        get { locked { $0.holdAttach } }
+        set { locked { $0.holdAttach = newValue } }
+    }
+
+    var exists: Bool { locked { $0.made } }
+    var isAttached: Bool { locked { $0.attached } }
+    var used: Int64? { locked { $0.attached ? $0.usedBytes : nil } }
+    var holdsFiles: Bool { locked { $0.attached && !$0.files.isEmpty } }
+    var onDisk: Int64 { locked { $0.imageBytes } }
+
+    func create(key: String) throws {
+        locked {
+            $0.asked.append("create")
+            $0.made = true
+            $0.key = key
+        }
+    }
+
+    func attach(key: String) throws {
+        _ = holdAttach?.wait(timeout: .now() + 5)
+        try locked {
+            $0.asked.append("attach")
+            if let failure = $0.attachFails { throw failure }
+            guard key == $0.key else { throw ShrugError("Authentication error") }
+            $0.attached = true
+        }
+    }
+
+    func eject() throws {
+        try locked {
+            $0.asked.append("eject")
+            if let failure = $0.ejectFails { throw failure }
+            $0.attached = false
+        }
+    }
+
+    func reclaim(key: String) throws {
+        locked {
+            $0.asked.append("reclaim")
+            $0.imageBytes = $0.usedBytes
+        }
+    }
+}
+
 /// One Mac: an engine with its own home folder, laid out like a real one (~/.shrug, ~/Shrug),
 /// driven through the virtual folder directly (no mount).
 final class Mac {
@@ -35,6 +130,7 @@ final class Mac {
     let paths: ShrugPaths
     /// The same chip after a restart: it's this Mac's hardware, not the app's.
     let chip: ChipSeal
+    let disk: FakeDisk
     let ctx = NFSContext(uid: getuid(), gid: getgid())
 
     static func paths(_ root: URL, _ name: String) -> ShrugPaths {
@@ -46,12 +142,14 @@ final class Mac {
     /// Unless a test passes its own `screen` or `network`, macOS is never asked about the real one. Every
     /// Mac has its own security chip, which tests stand in for.
     init(_ root: URL, _ name: String, clock: TestClock, touchID: TouchIDKeyStore? = nil, chip: ChipSeal = FakeChip(),
-         screen: ScreenWatch = ScreenWatch { nil }, network: NetworkWatch = NetworkWatch { nil }) {
+         screen: ScreenWatch = ScreenWatch { nil }, network: NetworkWatch = NetworkWatch { nil },
+         disk: FakeDisk = FakeDisk()) {
         paths = Mac.paths(root, name)
         self.chip = chip
+        self.disk = disk
         try? FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
         engine = Engine(paths: paths, clock: clock.clock, touchID: touchID, chip: chip, screen: screen,
-                        network: network)
+                        network: network, disk: disk)
     }
 
     var fs: VaultFS { engine.fs }
@@ -150,8 +248,9 @@ class ShrugTestCase: XCTestCase {
     var storage: StorageConfig { StorageConfig(kind: "folder", path: bucket.path) }
 
     func mac(_ name: String, touchID: TouchIDKeyStore? = nil, chip: ChipSeal = FakeChip(),
-             screen: ScreenWatch = ScreenWatch { nil }, network: NetworkWatch = NetworkWatch { nil }) -> Mac {
-        Mac(root, name, clock: time, touchID: touchID, chip: chip, screen: screen, network: network)
+             screen: ScreenWatch = ScreenWatch { nil }, network: NetworkWatch = NetworkWatch { nil },
+             disk: FakeDisk = FakeDisk()) -> Mac {
+        Mac(root, name, clock: time, touchID: touchID, chip: chip, screen: screen, network: network, disk: disk)
     }
 
     /// Follows `profile` on `mac`, agreeing to every link it asks about (as answering "y" does).

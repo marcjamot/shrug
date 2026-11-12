@@ -43,6 +43,23 @@ public struct LinkInfo: Codable, Sendable {
     }
 }
 
+/// ~/ShrugDisk, for status: there while Shrug is unlocked, or when something is wrong with it.
+public struct DiskInfo: Codable, Sendable {
+    /// Where it shows (~/ShrugDisk).
+    public var path: String
+    public var open = false
+    /// Being made or attached (or giving space back first).
+    public var opening = false
+    /// What's wrong: why it isn't open when it should be, or that it is when it shouldn't.
+    public var problem: String?
+    /// Bytes its files take.
+    public var used: Int64?
+    /// Bytes free on this Mac's own disk, which is what the disk can still grow into.
+    public var free: Int64?
+
+    public init(path: String) { self.path = path }
+}
+
 /// While locked, only the first few fields are filled: names stay hidden.
 public struct StatusInfo: Codable, Sendable {
     public var setUp: Bool
@@ -68,6 +85,7 @@ public struct StatusInfo: Codable, Sendable {
     public var trustedHere: String?
     /// The trusted network keeping Shrug unlocked while the screen is locked.
     public var held: String?
+    public var disk: DiskInfo?
 
     public init(setUp: Bool, unlocked: Bool, touchID: Bool, mounted: Bool, mount: String, device: String? = nil,
                 macs: [String] = [], profile: String? = nil, storage: String? = nil, online: Bool? = nil,

@@ -66,6 +66,10 @@ public struct PasswordNeeded: Error, CustomStringConvertible {
 ///
 /// The one exception: on a network you trust (`shrug trust`), a screen lock doesn't lock
 /// Shrug. It stays unlocked until the Mac leaves that network, sleeps, or you switch users.
+///
+/// ~/ShrugDisk follows the lock: attached on unlock, ejected on lock (see WorkDisk). Since it
+/// can't ask to unlock when a program needs it, Shrug asks once when you're back at the screen
+/// if you left with files on it (see `lockNow`).
 public final class Engine {
     public let paths: ShrugPaths
     let clock: Clock
@@ -97,10 +101,13 @@ public final class Engine {
     private var lastScreen: ScreenState?
     /// The trusted network keeping Shrug unlocked while the screen is locked (see `screenLocked`).
     private var heldBy: String?
+    /// Whether to ask to unlock when you're back at the screen (see `lockNow`).
+    private var reopen = Reopen.no
     var mounted = false
 
     var fs: VaultFS!
     var replicator: Replicator!
+    var disk: WorkDisk!
     var nfs: NFSServer?
     var ipc: IPCServer?
     var timer: DispatchSourceTimer?
@@ -125,9 +132,11 @@ public final class Engine {
     /// A program waiting on ~/Shrug gives up after about 30 seconds (see Mounter.mount), so
     /// the prompt it caused closes first instead of unlocking for nobody.
     let accessPromptTimeout: TimeInterval = 25
+    /// A Mac that wakes without a lock screen counts as yours again after this long.
+    let wakeGrace: TimeInterval = 3
 
     public init(paths: ShrugPaths, clock: Clock = .system, touchID: TouchIDKeyStore? = nil, chip: ChipSeal? = nil,
-                screen: ScreenWatch = .system, network: NetworkWatch = .system) {
+                screen: ScreenWatch = .system, network: NetworkWatch = .system, disk: DiskImage? = nil) {
         self.paths = paths
         self.clock = clock
         self.touchID = touchID ?? TouchIDStore(url: paths.touchIDFile)
@@ -147,6 +156,7 @@ public final class Engine {
         _ = try? logHandle?.seekToEnd()
         fs = VaultFS(engine: self)
         replicator = Replicator(engine: self)
+        self.disk = WorkDisk(engine: self, image: disk ?? SparseDisk(paths: paths))
     }
 
     // MARK: - Lifecycle
@@ -168,20 +178,29 @@ public final class Engine {
             log("\(error)")
             lastEventText = "\(error)"
         }
+        disk.reset()
 
         let distributed = DistributedNotificationCenter.default()
         observers.append((distributed, distributed.addObserver(forName: .init("com.apple.screenIsLocked"), object: nil,
                                                                queue: nil) { [weak self] _ in
             self?.screenLocked()
         }))
+        observers.append((distributed, distributed.addObserver(forName: .init("com.apple.screenIsUnlocked"), object: nil,
+                                                               queue: nil) { [weak self] _ in
+            self?.screenUnlocked()
+        }))
         let workspace = NSWorkspace.shared.notificationCenter
         observers.append((workspace, workspace.addObserver(forName: NSWorkspace.willSleepNotification, object: nil,
                                                            queue: nil) { [weak self] _ in
-            self?.lockNow("Mac went to sleep")
+            self?.lockNow("Mac went to sleep", away: .asleep)
+        }))
+        observers.append((workspace, workspace.addObserver(forName: NSWorkspace.didWakeNotification, object: nil,
+                                                           queue: nil) { [weak self] _ in
+            self?.woke()
         }))
         observers.append((workspace, workspace.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification,
                                                            object: nil, queue: nil) { [weak self] _ in
-            self?.lockNow("switched to another user")
+            self?.lockNow("switched to another user", away: .atScreen)
         }))
 
         // The slack lets macOS wake for this together with other timers, which saves battery.
@@ -365,6 +384,9 @@ public final class Engine {
         deniedUntil = nil
         reconcileDue = true
         passDue = clock.now()
+        reopen = .no
+        // Under the lock, so a lock that follows always finds the disk to eject.
+        disk.open(key: WorkDisk.key(local))
         lock.unlock()
         event("Unlocked")
         protectKeys()
@@ -417,7 +439,26 @@ public final class Engine {
         }
     }
 
-    public func lockNow(_ reason: String) {
+    /// How you left, when that is why Shrug locks.
+    enum Away { case atScreen, asleep }
+
+    /// Whether to ask to unlock once you're back at the screen.
+    private enum Reopen: Equatable {
+        case no
+        /// The Mac is asleep: nothing to look at until it wakes.
+        case afterWake
+        /// Waiting for the screen to be yours again. `sawLocked`: the lock screen (or another
+        /// user) has been seen since. `wokeAt`: the Mac woke then, perhaps with no lock screen.
+        case atScreen(sawLocked: Bool, wokeAt: Date?)
+    }
+
+    public func lockNow(_ reason: String) { lockNow(reason, away: nil) }
+
+    /// Locks, and ejects ~/ShrugDisk before returning. `away` says you left the Mac (the
+    /// screen locked, it went to sleep, another user took over) rather than asked for the
+    /// lock. The disk can't ask to unlock when a program needs it, so if you left with files
+    /// on it, Shrug asks once when you're back at the screen.
+    func lockNow(_ reason: String, away: Away?) {
         lock.lock()
         let wasOpen = _unlocked
         let store = _store
@@ -433,11 +474,81 @@ public final class Engine {
         previewers = [:]
         lastScreen = nil
         heldBy = nil
+        // Asking for the lock also takes back a question that was still waiting.
+        if away == nil { reopen = .no }
         lock.unlock()
         store?.close()
         fs.reset()
         replicator.forget()
+        let hadFiles = disk.close()
+        lock.lock()
+        if _unlocked, let local = _localKey {
+            // Unlocked again while the disk was being ejected: it comes back.
+            disk.open(key: WorkDisk.key(local))
+        } else if hadFiles, let away {
+            reopen = away == .asleep ? .afterWake : .atScreen(sawLocked: false, wokeAt: nil)
+        }
+        lock.unlock()
         if wasOpen { event("Locked: \(reason)") }
+    }
+
+    // MARK: - Back at the screen
+
+    /// The Mac woke up. Its lock screen, if it has one, comes next.
+    func woke() {
+        lock.lock()
+        if reopen == .afterWake { reopen = .atScreen(sawLocked: false, wokeAt: clock.now()) }
+        lock.unlock()
+    }
+
+    /// macOS says the screen was unlocked.
+    func screenUnlocked() {
+        lock.lock()
+        let waiting = reopen != .no
+        lock.unlock()
+        if waiting { askToReopen() }
+    }
+
+    /// Every second while a question is waiting: asks it once the screen is yours again. That
+    /// is after the lock screen was seen up and is gone, or, on a Mac that wakes without one,
+    /// a moment after waking. (`screenUnlocked` normally gets there first.)
+    func checkReopen() {
+        lock.lock()
+        guard !_unlocked, case .atScreen = reopen else { return lock.unlock() }
+        lock.unlock()
+        guard let now = screen.current() else { return }
+        lock.lock()
+        guard !_unlocked, case .atScreen(let sawLocked, let wokeAt) = reopen else { return lock.unlock() }
+        if now.locked || !now.ours {
+            reopen = .atScreen(sawLocked: true, wokeAt: wokeAt)
+            return lock.unlock()
+        }
+        let back = sawLocked || wokeAt.map { clock.now().timeIntervalSince($0) >= wakeGrace } ?? false
+        lock.unlock()
+        if back { askToReopen() }
+    }
+
+    /// One prompt, off this thread: a fingerprint, or the Shrug password where Touch ID can't
+    /// be used. Cancelled, Shrug stays locked and doesn't ask again.
+    private func askToReopen() {
+        lock.lock()
+        let ask = !_unlocked && reopen != .no
+        reopen = .no
+        lock.unlock()
+        guard ask, paths.isSetUp, touchID.isEnrolled || askPassword != nil else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            promptLock.lock()
+            defer { promptLock.unlock() }
+            if isUnlocked { return }
+            do {
+                guard touchID.isEnrolled else { throw PasswordNeeded() }
+                try unlockWithTouchID(reason: "unlock and open \(disk.shown) again")
+            } catch is PasswordNeeded {
+                _ = passwordUnlock("\(disk.shown) was open when you left", until: Date().addingTimeInterval(60))
+            } catch {
+                event("Stayed locked: \(disk.shown) opens again when Shrug unlocks", log: "stayed locked at the screen")
+            }
+        }
     }
 
     /// For the virtual folder: unlock with Touch ID if possible, else with the Shrug password
@@ -581,10 +692,10 @@ public final class Engine {
         lock.unlock()
         guard let before else { return }
         if before.ours && !now.ours {
-            lockNow("switched to another user")
+            lockNow("switched to another user", away: .atScreen)
         } else if now.locked && !before.locked {
             // With someone else at the screen, a trusted network keeps nothing open.
-            if now.ours { screenLocked() } else { lockNow("screen locked") }
+            if now.ours { screenLocked() } else { lockNow("screen locked", away: .atScreen) }
         } else if before.locked && !now.locked {
             screenOpened()
         }
@@ -605,7 +716,7 @@ public final class Engine {
         let gen = generation
         let trusted = (_unlocked ? _state?.trusted : nil) ?? []
         lock.unlock()
-        guard let here = trustedNetwork(among: trusted) else { return lockNow("screen locked") }
+        guard let here = trustedNetwork(among: trusted) else { return lockNow("screen locked", away: .atScreen) }
         lock.lock()
         // Locked, or locked and unlocked again, while asking: nothing to hold open.
         guard _unlocked, generation == gen else { return lock.unlock() }
@@ -643,7 +754,7 @@ public final class Engine {
         lock.lock()
         let still = _unlocked && generation == gen && heldBy != nil
         lock.unlock()
-        if still { lockNow("left the trusted network while the screen was locked") }
+        if still { lockNow("left the trusted network while the screen was locked", away: .atScreen) }
     }
 
     /// The network holding Shrug unlocked behind a locked screen, for status.
@@ -657,6 +768,8 @@ public final class Engine {
         ticks += 1
         checkScreen()
         checkNetwork()
+        checkReopen()
+        disk.retry()
         lock.lock()
         let store = _unlocked ? _store : nil
         var runPass = false
