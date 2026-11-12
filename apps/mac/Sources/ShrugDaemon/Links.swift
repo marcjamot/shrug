@@ -410,6 +410,15 @@ extension Engine {
         return .done(([head] + notes).joined(separator: "\n"))
     }
 
+    /// Every link in the profile, one per line, with what's wrong with those that don't work.
+    func links() throws -> String {
+        try requireUnlocked("unlock to list the links")
+        let lines = linkInfos().map { l in
+            l.state == "ok" ? "ok  \(l.path) -> \(l.target)" : "!!  \(l.path) -> \(l.target): \(l.state)"
+        }
+        return lines.isEmpty ? "No links yet: 'shrug add <path>' makes one." : lines.joined(separator: "\n")
+    }
+
     func linkInfos() -> [LinkInfo] {
         guard let st = stateCopy(), let store = store else { return [] }
         return st.links.map { link in

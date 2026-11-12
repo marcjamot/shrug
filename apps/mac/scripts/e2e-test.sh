@@ -85,6 +85,8 @@ echo "2. Files and links"
 printf 'PRIVATE KEY e2e\n' >"$T/home1/.ssh/id_e2e"
 check "add moves a file in and links it" ctl1 add "$T/home1/.ssh/id_e2e"
 check "the link points into ~/Shrug" sh -c "[ \"\$(readlink '$T/home1/.ssh/id_e2e')\" = '$T/mnt1/synced/ssh/id_e2e' ]"
+check "links lists it as ok" sh -c "env ${MAC1[*]} '$BIN/shrug' links | grep -q 'ok  ~/.ssh/id_e2e -> synced/ssh/id_e2e'"
+check "status counts it" status1_has "Links:     1 working"
 
 MOUNT_READS=1
 if ! cat "$T/home1/.ssh/id_e2e" >/dev/null 2>"$T/read.err"; then

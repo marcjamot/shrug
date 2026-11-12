@@ -36,6 +36,32 @@ final class IPCTests: ShrugTestCase {
         }
     }
 
+    func testLinksListsEveryLinkAndWhatIsWrongWithIt() throws {
+        let (a, _) = try twoMacsFollowing()
+        try withServer(a.engine) { socket in
+            XCTAssertEqual(try IPCClient.send(IPCRequest("links"), socket: socket).message,
+                           "No links yet: 'shrug add <path>' makes one.")
+            for name in [".kube/config", ".npmrc"] {
+                try a.putHome(name, "x")
+                _ = try a.engine.add(path: a.home(name).path, target: nil, cls: nil, choices: [:])
+            }
+            // A folder takes one link's place.
+            unlink(a.home(".npmrc").path)
+            try FileManager.default.createDirectory(at: a.home(".npmrc"), withIntermediateDirectories: false)
+            let r = try IPCClient.send(IPCRequest("links"), socket: socket)
+            XCTAssertTrue(r.ok, r.message)
+            XCTAssertEqual(r.message, """
+            ok  ~/.kube/config -> synced/kube/config
+            !!  ~/.npmrc -> synced/npmrc: a folder is in the way
+            """)
+            // Locked, it names nothing: the command line asks for the password first.
+            a.engine.lockNow("test")
+            let locked = try IPCClient.send(IPCRequest("links"), socket: socket)
+            XCTAssertEqual(locked.code, "password-needed")
+            XCTAssertFalse(locked.message.contains("kube"))
+        }
+    }
+
     func testUnlockWithoutTouchIDAsksForThePassword() throws {
         let (a, _) = try twoMacs()
         a.engine.lockNow("test")

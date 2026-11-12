@@ -15,11 +15,12 @@ Usage: shrug <command>
                            the place in ~/Shrug (default synced/<path>); --local or --remote
                            picks another folder
   remove <path>            Stop that link. The file stays in ~/Shrug
+  links                    List every link, and what's wrong with those that don't work
   use [<profile>]          Follow a profile (a new name creates one). Without a name, list them
   trust [<name>]           Trust the network this Mac is on: Shrug stays unlocked there when
                            the screen locks, until the Mac leaves it, sleeps or you switch user
   untrust [<name>]         Stop trusting a network (this one, unless you name another)
-  status                   Lock state, profile, storage, disk, links
+  status                   Lock state, profile, storage, disk, and the links that don't work
 
 Answers can also be piped in, one per line, in the order they're asked.
 """
@@ -241,9 +242,16 @@ func printStatus(_ s: StatusInfo) {
     if let trusted = s.trusted, !trusted.isEmpty {
         print("Trusted:   \(trusted.map { $0 == s.trustedHere ? "\($0) (this network)" : $0 }.joined(separator: ", "))")
     }
-    if !s.links.isEmpty {
-        print("Links:")
-        for l in s.links { print("  \(l.state == "ok" ? "ok" : "!!")  \(l.path) -> \(l.target)\(l.state == "ok" ? "" : ": \(l.state)")") }
+    // A count, and only the links that don't work, a few at most: `shrug links` lists them all.
+    let broken = s.links.filter { $0.state != "ok" }
+    if s.links.isEmpty {
+        print("Links:     none yet (shrug add <path>)")
+    } else if broken.isEmpty {
+        print("Links:     \(s.links.count) working")
+    } else {
+        print("Links:     \(s.links.count - broken.count) working, \(broken.count) not:")
+        for l in broken.prefix(10) { print("  \(l.path): \(l.state)") }
+        if broken.count > 10 { print("  and \(broken.count - 10) more ('shrug links' lists them all)") }
     }
     if !s.notices.isEmpty {
         print("Notices:")
@@ -334,6 +342,9 @@ case "add":
 case "remove":
     guard let path = args.first else { die("remove needs a path") }
     run("remove", ["path": absolute(path)])
+
+case "links":
+    run("links")
 
 case "trust":
     // Always confirmed, even when unlocked: a fingerprint, or else the Shrug password.

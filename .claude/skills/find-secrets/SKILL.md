@@ -18,8 +18,9 @@ recommendation. The user is a developer; keep the report brief.
   or counts.
 - **Don't move anything yourself.** End with the commands, and run them only
   if the user says so, one at a time.
-- Skip what Shrug already manages: run `shrug status` (it lists this Mac's
-  links; unlock first if it says locked), and ignore symlinks into `~/Shrug`.
+- Skip what Shrug already manages: run `shrug links` (it lists this Mac's
+  links; if Shrug is locked, have the user unlock it first), and ignore
+  symlinks into `~/Shrug`.
 
 ## Where to look
 

@@ -113,6 +113,8 @@ extension Engine {
                 return outcome(try add(path: a["path"] ?? "", target: a["target"], cls: cls, choices: Engine.choices(a)))
             case "remove":
                 return ok(try remove(path: a["path"] ?? ""))
+            case "links":
+                return ok(try links())
             case "trust":
                 return ok(try trust(name: a["name"], password: a["password"]))
             case "untrust":

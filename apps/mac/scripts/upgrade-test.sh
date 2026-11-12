@@ -78,7 +78,7 @@ NEW_FORMAT=$(cat "$T/state/version" 2>/dev/null)
 check "this Mac's files are in this version's format ($OLD_FORMAT -> ${NEW_FORMAT:-none})" test -n "$NEW_FORMAT" -a "$NEW_FORMAT" -ge "$OLD_FORMAT"
 check "the vault is upgraded too" test "$(vault_format)" = "$NEW_FORMAT"
 check "the key reads through its link" grep -q 'OLD PRIVATE KEY' "$T/home/.ssh/id_upgrade"
-check "the link is still ok" sh -c "env ${MAC[*]} '$BIN/shrug' status | grep -q 'ok  ~/.ssh/id_upgrade'"
+check "the link is still ok" sh -c "env ${MAC[*]} '$BIN/shrug' links | grep -q 'ok  ~/.ssh/id_upgrade'"
 check "the synced/ file is intact" cmp "$T/big.bin" "$T/mnt/synced/big.bin"
 check "the remote/ file streams" cmp "$T/big.bin" "$T/mnt/remote/big.bin"
 check "the local/ file is there" grep -q 'this Mac only' "$T/mnt/local/mine.txt"
