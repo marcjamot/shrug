@@ -1,0 +1,9 @@
+{
+  "keyring" : {
+    "iterations" : 1000,
+    "kdf" : "pbkdf2-sha256",
+    "salt" : "FuRw2V15ozdgOr+zSkbQwg==",
+    "wrappedKey" : "LLGBHhmob+3LG8CAGV6+vKUxaOT3MOQRnYPsW70XDaLKphyZdll+29BlpKYL5LwvDjy0n7YNB708nn4R"
+  },
+  "version" : 3
+}

@@ -26,6 +26,7 @@ final class MemoryFS: NFSFileSystem {
         .success((content.dropFirst(Int(offset)).prefix(Int(count)), true))
     }
     func write(_ id: UInt64, offset: UInt64, data: Data, _ ctx: NFSContext) -> Result<Void, NFSStat> { .success(()) }
+    func commit(_ id: UInt64, _ ctx: NFSContext) -> Result<Void, NFSStat> { .success(()) }
     func create(_ dir: UInt64, _ name: String, mode: UInt32?, exclusive: Bool, _ ctx: NFSContext) -> Result<UInt64, NFSStat> {
         .failure(.acces)
     }

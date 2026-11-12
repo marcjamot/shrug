@@ -346,6 +346,9 @@ public final class Engine {
         try Migrations.upgradeLocal(paths, keys: vault, localKey: local, log: log)
         let state = try Engine.readState(paths, key: local)
         let store = try Store(paths: paths, keys: vault, localKey: local, clock: clock)
+        if store.ignoredJournalBytes > 0 {
+            log("the index journal ended in \(store.ignoredJournalBytes) bytes that don't belong to it (a crash while saving); they were left out")
+        }
         let storage = try Storage.make(state.storage, state.credentials)
         let screenNow = screen.current()
         lock.lock()
@@ -358,6 +361,7 @@ public final class Engine {
         _storage = storage
         _unlocked = true
         generation += 1
+        globalEpoch += 1 // a listing made while locked is out of date now
         deniedUntil = nil
         reconcileDue = true
         passDue = clock.now()

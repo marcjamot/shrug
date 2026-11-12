@@ -20,9 +20,12 @@ final class VaultFS: NFSFileSystem {
     /// ~/Shrug as you'd type it, for Touch ID prompts.
     private let shownMount: String
     let caseInsensitive = false
-    /// Plenty for secrets, and it keeps one stray write from filling the disk.
-    static let maxFileSize: UInt64 = 1 << 30
+    /// The most a bucket takes in one object (5 TiB), less room for what encryption adds.
+    static let maxFileSize: UInt64 = 1 << 42
     var maxFileSize: UInt64 { VaultFS.maxFileSize }
+    /// Kept free on this Mac's disk: a write that would leave less is refused, so nothing a
+    /// program does in ~/Shrug can fill the disk.
+    var reserve: UInt64 = 1 << 29
 
     static let neverIndex = ".metadata_never_index"
     static let fixed: [String: UInt64] = ["": 1, "local": 2, "synced": 3, "remote": 4, neverIndex: 5]
@@ -66,19 +69,30 @@ final class VaultFS: NFSFileSystem {
         return id
     }
 
-    private func forget(_ path: String) {
+    /// Forgets a path's id; with `folder`, those of everything that was in it too.
+    private func forget(_ path: String, folder: Bool) {
         lock.lock()
         defer { lock.unlock() }
-        for (p, id) in byPath where p == path || p.hasPrefix(path + "/") {
+        if let id = byPath.removeValue(forKey: path) { byID[id] = nil }
+        guard folder else { return }
+        for (p, id) in byPath where p.hasPrefix(path + "/") {
             byPath[p] = nil
             byID[id] = nil
         }
     }
 
-    private func moved(_ from: String, _ to: String) {
+    /// Ids follow a path to its new name; with `folder`, so does everything in it.
+    private func moved(_ from: String, _ to: String, folder: Bool) {
         lock.lock()
         defer { lock.unlock() }
         if let old = byPath[to] { byID[old] = nil; byPath[to] = nil }
+        guard folder else {
+            if let id = byPath.removeValue(forKey: from) {
+                byPath[to] = id
+                byID[id] = to
+            }
+            return
+        }
         for (p, id) in byPath where p == from || p.hasPrefix(from + "/") {
             let np = to + p.dropFirst(from.count)
             byPath[p] = nil
@@ -119,14 +133,16 @@ final class VaultFS: NFSFileSystem {
             return .success(NFSAttr(type: .regular, mode: 0o400, nlink: 1, uid: uid, gid: gid, size: 0, used: 0,
                                     fileid: id, atime: t, mtime: t, ctime: t))
         }
-        if FileClass(rawValue: path) != nil { return .success(dirAttr(id, mode: 0o700)) }
+        if FileClass(rawValue: path) != nil {
+            return .success(dirAttr(id, mode: 0o700, mtime: engine.store?.folderTime(path)))
+        }
         guard let store = engine.store else { return .failure(.stale) }
         if let e = store.entry(path), e.kind == .file {
             let t = nfsTime(e.mtime, epoch: engine.epoch)
             return .success(NFSAttr(type: .regular, mode: UInt32(e.mode & 0o700), nlink: 1, uid: uid, gid: gid,
                                     size: UInt64(e.size), used: UInt64(e.size), fileid: id, atime: t, mtime: t, ctime: t))
         }
-        if store.isDirectory(path) { return .success(dirAttr(id, mode: 0o700, mtime: store.entry(path)?.mtime)) }
+        if store.isDirectory(path) { return .success(dirAttr(id, mode: 0o700, mtime: store.folderTime(path))) }
         return .failure(.stale)
     }
 
@@ -206,6 +222,13 @@ final class VaultFS: NFSFileSystem {
         }
     }
 
+    /// Whether this Mac's disk can take `bytes` more and keep its reserve.
+    private func hasRoom(for bytes: UInt64) -> Bool {
+        var s = statfs()
+        guard statfs(engine.paths.state.path, &s) == 0 else { return true }
+        return UInt64(s.f_bavail) * UInt64(s.f_bsize) >= bytes + reserve
+    }
+
     /// A remote/ file must be on this Mac before it can change.
     private func ensureLocal(_ store: Store, _ path: String) -> NFSStat? {
         guard Store.fileClass(path) == .remote, let e = store.entry(path), e.kind == .file, !e.cached else { return nil }
@@ -231,6 +254,8 @@ final class VaultFS: NFSFileSystem {
         defer { l.unlock() }
         do {
             let f = try store.open(path, writable: true)
+            let end = offset + UInt64(data.count)
+            if end > UInt64(f.size), !hasRoom(for: end - UInt64(f.size)) { return .failure(.nospc) }
             // Shrug locked after the file opened: writing now would leave an edit that never uploads.
             guard store.willChange(path) else { return .failure(.acces) }
             try f.write(offset: Int64(offset), data: data)
@@ -239,6 +264,21 @@ final class VaultFS: NFSFileSystem {
             return .success(())
         } catch {
             engine.log("write failed: \(error)")
+            return .failure(.io)
+        }
+    }
+
+    /// A program asked for what it wrote to be on the disk (fsync, or closing the file).
+    func commit(_ id: UInt64, _ ctx: NFSContext) -> Result<Void, NFSStat> {
+        guard let path = path(id) else { return .failure(.stale) }
+        if VaultFS.fixed[path] != nil { return .success(()) }
+        // Locking saved everything, and never asks to unlock for this.
+        guard let store = engine.store else { return .failure(.stale) }
+        do {
+            try store.sync(path)
+            return .success(())
+        } catch {
+            engine.log("sync failed: \(error)")
             return .failure(.io)
         }
     }
@@ -294,7 +334,7 @@ final class VaultFS: NFSFileSystem {
             guard let e = store.entry(child) else { return store.isDirectory(child) ? .failure(.isdir) : .failure(.noent) }
             guard e.kind == .file else { return .failure(.isdir) }
             store.remove(child)
-            forget(child)
+            forget(child, folder: false)
             engine.localChange()
             return .success(())
         }
@@ -311,7 +351,7 @@ final class VaultFS: NFSFileSystem {
             guard names.allSatisfy(Store.isScratch) else { return .failure(.notempty) }
             for n in names { store.remove(VaultFS.join(child, n)) }
             store.remove(child)
-            forget(child)
+            forget(child, folder: true)
             engine.localChange()
             return .success(())
         }
@@ -325,14 +365,17 @@ final class VaultFS: NFSFileSystem {
         guard Store.fileClass(from) == Store.fileClass(to) else { return .failure(.xdev) }
         guard store.exists(from) else { return .failure(.noent) }
         if to == from || to.hasPrefix(from + "/") { return .failure(.inval) }
+        let folder = store.isDirectory(from)
         if store.isDirectory(to) && !store.children(to).isEmpty { return .failure(.notempty) }
-        if store.isDirectory(from) != store.isDirectory(to) && store.exists(to) {
+        if folder != store.isDirectory(to) && store.exists(to) {
             return .failure(store.isDirectory(to) ? .isdir : .notdir)
         }
+        guard store.canRename(from, to) else { return .failure(.xdev) }
         // Moving a remote/ file means re-uploading it, so its content has to be here.
-        for (p, e) in store.all() where e.kind == .file && !e.cached && Store.fileClass(p) == .remote
-            && (p == from || p.hasPrefix(from + "/")) {
-            if let failure = ensureLocal(store, p) { return .failure(failure) }
+        if Store.fileClass(from) == .remote {
+            for (p, e) in store.tree(from) where e.kind == .file && !e.cached {
+                if let failure = ensureLocal(store, p) { return .failure(failure) }
+            }
         }
         do {
             try store.rename(from, to)
@@ -340,7 +383,7 @@ final class VaultFS: NFSFileSystem {
             engine.log("rename failed: \(error)")
             return .failure(.io)
         }
-        moved(from, to)
+        moved(from, to, folder: folder)
         engine.renamed(from, to)
         engine.localChange()
         return .success(())
@@ -360,6 +403,7 @@ final class VaultFS: NFSFileSystem {
             do {
                 let f = try store.open(path, writable: true)
                 if f.size != Int64(size) {
+                    if size > UInt64(f.size), !hasRoom(for: size - UInt64(f.size)) { return .failure(.nospc) }
                     guard store.willChange(path) else { return .failure(.acces) }
                     try f.truncate(to: Int64(size))
                     store.didWrite(path, size: f.size)
@@ -388,7 +432,8 @@ final class VaultFS: NFSFileSystem {
             return NFSFSStat(totalBytes: 0, freeBytes: 0, totalFiles: 0, freeFiles: 0)
         }
         let bs = UInt64(s.f_bsize)
-        return NFSFSStat(totalBytes: UInt64(s.f_blocks) * bs, freeBytes: UInt64(s.f_bavail) * bs,
+        let free = UInt64(s.f_bavail) * bs
+        return NFSFSStat(totalBytes: UInt64(s.f_blocks) * bs, freeBytes: free > reserve ? free - reserve : 0,
                          totalFiles: UInt64(s.f_files), freeFiles: UInt64(s.f_ffree))
     }
 }

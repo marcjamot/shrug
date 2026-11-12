@@ -43,10 +43,14 @@ public struct ShrugPaths: Sendable {
     public var stateFile: URL { state.appendingPathComponent("state.enc") }
     /// What's in ~/Shrug: encrypted with the local key.
     public var indexFile: URL { state.appendingPathComponent("index.enc") }
+    /// The changes to the index since it was last written whole: encrypted with the local key.
+    public var journalFile: URL { state.appendingPathComponent("index.journal") }
     /// Local copies of synced/ and remote/ files, named by their (random-looking) bucket key.
     public var objectStore: URL { state.appendingPathComponent("store/objects") }
     /// local/ files, named by random ids.
     public var localStore: URL { state.appendingPathComponent("store/local") }
+    /// Files that only last until Shrug locks (see Store), named by random ids.
+    public var scratchStore: URL { state.appendingPathComponent("store/scratch") }
     public var logFile: URL { state.appendingPathComponent("shrug.log") }
 
     public var isSetUp: Bool { FileManager.default.fileExists(atPath: keyringFile.path) }

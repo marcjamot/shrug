@@ -18,6 +18,9 @@ final class TreeFS: NFSFileSystem {
     private let lock = NSLock()
     private var nodes: [UInt64: Node] = [1: Node(parent: 1, name: "", isDir: true, mode: 0o700)]
     private var next: UInt64 = 2
+    /// The files asked to be put on the disk, in order.
+    private(set) var committed: [UInt64] = []
+    var commitFails = false
 
     private func child(_ dir: UInt64, _ name: String) -> UInt64? {
         nodes.first { $0.key != 1 && $0.value.parent == dir && $0.value.name == name }?.key
@@ -75,6 +78,15 @@ final class TreeFS: NFSFileSystem {
             if n.data.count < end { n.data.append(Data(count: end - n.data.count)) }
             n.data.replaceSubrange(Int(offset)..<end, with: data)
             nodes[id] = n
+            return .success(())
+        }
+    }
+
+    func commit(_ id: UInt64, _ ctx: NFSContext) -> Result<Void, NFSStat> {
+        locked {
+            guard nodes[id] != nil else { return .failure(.stale) }
+            if commitFails { return .failure(.io) }
+            committed.append(id)
             return .success(())
         }
     }
@@ -266,23 +278,38 @@ final class NFSWireTests: XCTestCase {
         return (status, handle)
     }
 
-    func write(_ file: Data, _ offset: UInt64, _ data: Data) throws -> UInt32 {
+    /// `stable` is what the kernel asks for: 0 (UNSTABLE: a COMMIT follows) or 2 (FILE_SYNC).
+    func write(_ file: Data, _ offset: UInt64, _ data: Data, stable: UInt32 = 2) throws -> UInt32 {
         var r = try nfs(7) {
             $0.opaque(file)
             $0.u64(offset)
             $0.u32(UInt32(data.count))
-            $0.u32(2)
+            $0.u32(stable)
             $0.opaque(data)
         }
         let status = try r.u32()
         try r.wcc()
         if status == 0 {
             XCTAssertEqual(try r.u32(), UInt32(data.count))
-            XCTAssertEqual(try r.u32(), 2, "FILE_SYNC")
+            XCTAssertEqual(try r.u32(), stable == 0 ? 0 : 2, "committed only as far as asked")
             _ = try r.fixed(8)
         }
         XCTAssertTrue(r.atEnd, "WRITE reply has exactly its fields")
         return status
+    }
+
+    /// COMMIT; returns the status and the write verifier.
+    func commit(_ file: Data) throws -> (UInt32, Data?) {
+        var r = try nfs(21) {
+            $0.opaque(file)
+            $0.u64(0)
+            $0.u32(0)
+        }
+        let status = try r.u32()
+        try r.wcc()
+        let verifier = status == 0 ? try r.fixed(8) : nil
+        XCTAssertTrue(r.atEnd, "COMMIT reply has exactly its fields")
+        return (status, verifier)
     }
 
     func read(_ file: Data, _ offset: UInt64 = 0, _ count: UInt32 = 1 << 16) throws -> (Data, Bool) {
@@ -492,15 +519,23 @@ final class NFSWireTests: XCTestCase {
         XCTAssertTrue(conf.atEnd, "PATHCONF")
 
         let f = try XCTUnwrap(try create(root, "f").1)
-        var commit = try nfs(21) {
-            $0.opaque(f)
-            $0.u64(0)
-            $0.u32(0)
-        }
-        XCTAssertEqual(try commit.u32(), 0)
-        try commit.wcc()
-        _ = try commit.fixed(8)
-        XCTAssertTrue(commit.atEnd, "COMMIT")
+        XCTAssertEqual(try commit(f).0, 0)
+    }
+
+    func testWritesReachTheDiskWhenAsked() throws {
+        let f = try XCTUnwrap(try create(root, "f").1)
+        XCTAssertEqual(try write(f, 0, Data("one".utf8), stable: 0), 0)
+        XCTAssertEqual(fs.committed, [], "an ordinary write isn't synced, and doesn't claim to be")
+        XCTAssertEqual(try commit(f).0, 0)
+        XCTAssertEqual(fs.committed.count, 1, "the program's fsync is")
+        XCTAssertEqual(try write(f, 3, Data("two".utf8), stable: 2), 0)
+        XCTAssertEqual(fs.committed.count, 2, "and so is a write that asks for it")
+        XCTAssertEqual(try read(f).0, Data("onetwo".utf8))
+
+        fs.commitFails = true
+        XCTAssertEqual(try commit(f).0, NFSStat.io.rawValue, "a sync that fails is never called done")
+        XCTAssertEqual(try write(f, 0, Data("x".utf8), stable: 2), NFSStat.io.rawValue)
+        XCTAssertEqual(try write(f, 0, Data("x".utf8), stable: 0), 0)
     }
 
     func testInfoProceduresRefuseHandlesWithoutTheSecret() throws {

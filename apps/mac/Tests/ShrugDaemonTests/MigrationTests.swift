@@ -15,8 +15,11 @@ import XCTest
 ///   local/only-here.txt     "this Mac only\n"
 ///   synced/pending.txt      "not uploaded yet", still waiting to upload
 ///
-/// format2 was made by Shrug e17cd90, the last format-2 version. Before changing a format,
-/// write a fixture of the current one with the current code:
+/// format2 was made by Shrug e17cd90, the last format-2 version, and format3 by 49826da, the
+/// last format-3 one. format3 also holds two of the ._ files macOS adds, which Shrug saved like
+/// any other file until format 4: synced/docs/._note.txt and local/._only-here.txt.
+///
+/// Before changing a format, write a fixture of the current one with the current code:
 ///   FIXTURE_OUT=$PWD/Tests/ShrugDaemonTests/Fixtures/format<N> swift test --filter testWriteCurrentFormatFixture
 final class MigrationTests: ShrugTestCase {
     let fixturePassword = "fixture password"
@@ -40,6 +43,9 @@ final class MigrationTests: ShrugTestCase {
         try m.write("synced/gone.txt", Data("deleted later".utf8))
         try m.write("remote/archive.bin", bytes(70_000, seed: 2))
         try m.write("local/only-here.txt", Data("this Mac only\n".utf8))
+        // What macOS adds next to a file that has extended attributes (gone again by the lock below).
+        try m.write("synced/docs/._note.txt", bytes(4096, seed: 3))
+        try m.write("local/._only-here.txt", bytes(4096, seed: 4))
         m.sync()
         try m.write("synced/rotated.txt", Data("token-version-2".utf8))
         try m.remove("synced/gone.txt")
@@ -183,6 +189,68 @@ final class MigrationTests: ShrugTestCase {
         b.sync()
         try assertFixtureContents(b)
         XCTAssertEqual(try b.names("local"), [])
+    }
+
+    func testFormat3Upgrades() throws {
+        let m = try install(fixture("format3"))
+        XCTAssertEqual(try Migrations.localFormat(m.paths), 3)
+        XCTAssertEqual(vaultFormat, 3)
+        func copies(_ dir: URL) throws -> Int { try FileManager.default.contentsOfDirectory(atPath: dir.path).count }
+        XCTAssertEqual(try copies(m.paths.objectStore), 6)
+        XCTAssertEqual(try copies(m.paths.localStore), 2)
+
+        try m.engine.unlock(password: fixturePassword)
+        XCTAssertEqual(try Migrations.localFormat(m.paths), Migrations.current, "this Mac's files upgrade on unlock")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: m.paths.journalFile.path), "the index has its journal")
+        try assertLocalCopies(m)
+        XCTAssertEqual(try m.names("synced/docs"), ["note.txt"], "the ._ files macOS added are gone")
+        XCTAssertEqual(try m.names("local"), ["only-here.txt"])
+        XCTAssertEqual(try copies(m.paths.objectStore), 5, "and so is their content")
+        XCTAssertEqual(try copies(m.paths.localStore), 1)
+        XCTAssertEqual(m.engine.status().waiting, 1, "what was waiting to upload still is")
+
+        m.sync()
+        XCTAssertNil(m.engine.status().problem)
+        XCTAssertEqual(vaultFormat, Migrations.current, "the vault upgrades in the first pass")
+        try assertFixtureContents(m)
+        XCTAssertEqual(m.engine.status().waiting, 0)
+        m.engine.reconcile()
+        XCTAssertEqual(m.engine.status().links.map(\.state), ["ok"])
+
+        // Changes from here go to the journal, and are there after a lock.
+        try m.write("synced/docs/new.txt", Data("after the upgrade".utf8))
+        try m.remove("local/only-here.txt")
+        m.engine.lockNow("test")
+        try m.engine.unlock(password: fixturePassword)
+        XCTAssertEqual(try m.text("synced/docs/new.txt"), "after the upgrade")
+        XCTAssertEqual(try m.names("local"), [])
+        try assertFixtureContents(m)
+
+        // A Mac that joins now sees all of it.
+        m.sync()
+        let b = mac("b")
+        _ = try b.engine.setup(storage, nil, password: fixturePassword, deviceName: "b", create: false)
+        b.sync()
+        try assertFixtureContents(b)
+        XCTAssertEqual(try b.names("synced/docs"), ["new.txt", "note.txt"])
+    }
+
+    /// The upgrade stopped after the index was converted, before the format number went up:
+    /// the step runs again on what it already converted.
+    func testTheFormat4StepIsSafeToRepeat() throws {
+        let m = try install(fixture("format3"))
+        try m.engine.unlock(password: fixturePassword)
+        m.engine.lockNow("test")
+        try Migrations.setLocalFormat(3, m.paths)
+        try FileManager.default.removeItem(at: m.paths.journalFile)
+
+        try m.engine.unlock(password: fixturePassword)
+        XCTAssertEqual(try Migrations.localFormat(m.paths), Migrations.current)
+        try assertLocalCopies(m)
+        XCTAssertEqual(try m.names("synced/docs"), ["note.txt"])
+        m.sync()
+        XCTAssertNil(m.engine.status().problem)
+        try assertFixtureContents(m)
     }
 
     func testAnInterruptedUpgradeCarriesOn() throws {

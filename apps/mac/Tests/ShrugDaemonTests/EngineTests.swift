@@ -340,6 +340,5 @@ final class EngineTests: ShrugTestCase {
         try a.fs.setattr(id, attrs, a.ctx).get()
         XCTAssertEqual(try a.read("synced/f").count, 3 << 20, "a gap of several chunks fills with zeros")
         XCTAssertEqual(try a.read("synced/f").prefix(1), Data("x".utf8))
-        XCTAssertEqual(a.fs.maxFileSize, 1 << 30)
     }
 }

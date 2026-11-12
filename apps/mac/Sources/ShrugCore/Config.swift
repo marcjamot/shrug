@@ -12,6 +12,14 @@ public enum JSONFile {
         return e
     }()
 
+    /// The same, on one line: for what only Shrug reads, and writes often.
+    static let compactEncoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.outputFormatting = [.withoutEscapingSlashes]
+        e.dateEncodingStrategy = encoder.dateEncodingStrategy
+        return e
+    }()
+
     static let decoder: JSONDecoder = {
         let d = JSONDecoder()
         d.dateDecodingStrategy = .custom { decoder in
@@ -35,6 +43,10 @@ public enum JSONFile {
 
     public static func encode<T: Encodable>(_ value: T) throws -> Data {
         try encoder.encode(value)
+    }
+
+    public static func encodeCompact<T: Encodable>(_ value: T) throws -> Data {
+        try compactEncoder.encode(value)
     }
 
     public static func save<T: Encodable>(_ value: T, to url: URL) throws {

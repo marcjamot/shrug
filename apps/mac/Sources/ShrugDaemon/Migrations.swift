@@ -28,6 +28,7 @@ enum Migrations {
 
     static let steps: [Step] = [
         Step(format: 3, local: Format3.local, vault: Format3.vault),
+        Step(format: 4, local: Format4.local, vault: Format4.vault),
     ]
 
     static var current: Int { steps.last?.format ?? oldest }
@@ -186,4 +187,37 @@ enum Format3 {
             _ = try v.storage.upload(obj.key, from: new, replacing: obj.version)
         }
     }
+}
+
+/// Format 4: this Mac's index is written whole now and then, with a journal of the changes
+/// since (see SavedIndex); the ._ files macOS adds are no longer saved; files can be larger
+/// than 1 GiB.
+enum Format4 {
+    /// The index names its journal, and both start out together. The ._ files it listed go,
+    /// with their content: a new one only lasts until Shrug locks (see `Store.isAppleDouble`).
+    /// Any that reached the bucket stay: that never happened with Shrug's own uploads.
+    static func local(_ files: LocalUpgrade) throws {
+        guard var index = try files.index() else { return } // nothing saved yet: the store starts both
+        var entries = index["entries"] as? [String: [String: Any]] ?? [:]
+        for (path, e) in entries where Store.isAppleDouble(Store.name(path)) && e["version"] == nil {
+            let kind = e["kind"] as? String
+            guard kind == "file" || kind == "deleted" else { continue }
+            if kind == "file" {
+                let content = Store.fileClass(path) == .local
+                    ? files.paths.localStore.appendingPathComponent(e["blob"] as? String ?? "missing")
+                    : files.paths.objectStore.appendingPathComponent(String(files.keys.objectKey(path).dropFirst(2)))
+                unlink(content.path)
+            }
+            entries[path] = nil
+        }
+        let journal = ShrugCrypto.random(16)
+        index["entries"] = entries
+        index["journal"] = journal.hex
+        try files.writeIndex(index)
+        try JSONFile.writeAtomically(SavedIndex.magic + journal, to: files.paths.journalFile)
+    }
+
+    /// Nothing to convert. The vault may hold files larger than 1 GiB from here on, which an
+    /// older Shrug takes for damage: the new number has it ask for an update instead.
+    static func vault(_ v: VaultUpgrade) throws {}
 }

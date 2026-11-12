@@ -98,8 +98,11 @@ enum Mounter {
             "vers=3", "tcp", "port=\(port)", "mountport=\(port)",
             // Locks stay local; nothing to coordinate with a remote host.
             "locallocks",
-            // Revalidate on every open, so a lock takes effect even for cached files.
-            "noac", "nonegnamecache",
+            // A file's attributes are never cached, so every open and read asks Shrug first and
+            // a lock takes effect at once, even for contents the system still holds. A folder's
+            // are cached for up to a second, which saves most of the round trips in looking up
+            // a path; names can show that much longer after a lock, or after Shrug changes them.
+            "acregmin=0", "acregmax=0", "acdirmin=1", "acdirmax=1", "nonegnamecache",
             // Fail instead of hanging forever if Shrug stops, but wait out a Touch ID prompt.
             // Without dumbtimer, macOS ignores timeo and estimates it from loopback round
             // trips, giving up after about half a second. Either way, a soft mount never

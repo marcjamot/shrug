@@ -100,6 +100,8 @@ public protocol NFSFileSystem: AnyObject {
     func readdir(_ dir: UInt64) -> Result<[NFSDirEntry], NFSStat>
     func read(_ id: UInt64, offset: UInt64, count: UInt32, _ ctx: NFSContext) -> Result<(Data, Bool), NFSStat>
     func write(_ id: UInt64, offset: UInt64, data: Data, _ ctx: NFSContext) -> Result<Void, NFSStat>
+    /// Puts everything written to a file so far on the disk: what a program's fsync asks for.
+    func commit(_ id: UInt64, _ ctx: NFSContext) -> Result<Void, NFSStat>
     func create(_ dir: UInt64, _ name: String, mode: UInt32?, exclusive: Bool, _ ctx: NFSContext) -> Result<UInt64, NFSStat>
     func mkdir(_ dir: UInt64, _ name: String, mode: UInt32?, _ ctx: NFSContext) -> Result<UInt64, NFSStat>
     func remove(_ dir: UInt64, _ name: String, _ ctx: NFSContext) -> Result<Void, NFSStat>
@@ -252,7 +254,7 @@ public final class NFSServer {
         case 18: try fsstat(&a, &out)
         case 19: try fsinfo(&a, &out)
         case 20: try pathconf(&a, &out)
-        case 21: try commit(&a, &out)
+        case 21: try commit(&a, &out, ctx)
         default: return .procUnavail
         }
         return .success
@@ -469,7 +471,7 @@ public final class NFSServer {
         let id = try readHandle(&a)
         let offset = try a.u64()
         _ = try a.u32() // count
-        _ = try a.u32() // stable_how: we always write through
+        let stable = try a.u32() != 0 // DATA_SYNC or FILE_SYNC: on the disk before the reply
         let data = try a.opaque(max: 1 << 20)
         guard let id else {
             out.u32(NFSStat.badhandle.rawValue)
@@ -481,12 +483,17 @@ public final class NFSServer {
             wcc(id, &out)
             return
         }
-        switch fs.write(id, offset: offset, data: data, ctx) {
+        // A write is only called committed when it was asked to be. For the others the kernel
+        // sends COMMIT when a program syncs or closes the file, and the verifier tells it if
+        // the server restarted in between.
+        var result = fs.write(id, offset: offset, data: data, ctx)
+        if stable, case .success = result { result = fs.commit(id, ctx) }
+        switch result {
         case .success:
             out.u32(0)
             wcc(id, &out)
             out.u32(UInt32(data.count))
-            out.u32(2) // FILE_SYNC
+            out.u32(stable ? 2 : 0) // FILE_SYNC or UNSTABLE
             out.fixed(writeVerifier)
         case .failure(let e):
             out.u32(e.rawValue)
@@ -681,15 +688,22 @@ public final class NFSServer {
         out.bool(true) // case_preserving
     }
 
-    private func commit(_ a: inout XDRReader, _ out: inout XDRWriter) throws {
+    /// The whole file is synced, whatever range was asked for.
+    private func commit(_ a: inout XDRReader, _ out: inout XDRWriter, _ ctx: NFSContext) throws {
         guard let id = try readHandle(&a) else {
             out.u32(NFSStat.badhandle.rawValue)
             wccEmpty(&out)
             return
         }
-        out.u32(0)
-        wcc(id, &out)
-        out.fixed(writeVerifier)
+        switch fs.commit(id, ctx) {
+        case .success:
+            out.u32(0)
+            wcc(id, &out)
+            out.fixed(writeVerifier)
+        case .failure(let e):
+            out.u32(e.rawValue)
+            wcc(id, &out)
+        }
     }
 }
 
